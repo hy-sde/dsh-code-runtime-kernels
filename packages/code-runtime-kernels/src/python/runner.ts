@@ -326,22 +326,31 @@ _TLA_FLAG = getattr(ast, "PyCF_ALLOW_TOP_LEVEL_AWAIT", 0x2000)
 
 
 def _compile_source(source: str) -> tuple[Any, Any | None, bool]:
-    """Returns (body_code, expr_code, ok). A parse error yields (None, None, False)."""
+    """Returns (body_code, expr_code, ok). A parse OR compile error yields (None, None, False)."""
     try:
         module = ast.parse(source, "<cell>", "exec")
     except SyntaxError:
         return None, None, False
     if not module.body:
         return None, None, True
-    last = module.body[-1]
-    if isinstance(last, ast.Expr):
-        body_module = ast.Module(body=module.body[:-1], type_ignores=[])
-        expr_module = ast.Expression(body=last.value)
-        ast.copy_location(expr_module, last)
-        body_code = compile(body_module, "<cell>", "exec", flags=_TLA_FLAG)
-        expr_code = compile(expr_module, "<cell>", "eval", flags=_TLA_FLAG)
-        return body_code, expr_code, True
-    return compile(module, "<cell>", "exec", flags=_TLA_FLAG), None, True
+    try:
+        last = module.body[-1]
+        if isinstance(last, ast.Expr):
+            body_module = ast.Module(body=module.body[:-1], type_ignores=[])
+            expr_module = ast.Expression(body=last.value)
+            ast.copy_location(expr_module, last)
+            body_code = compile(body_module, "<cell>", "exec", flags=_TLA_FLAG)
+            expr_code = compile(expr_module, "<cell>", "eval", flags=_TLA_FLAG)
+            return body_code, expr_code, True
+        return compile(module, "<cell>", "exec", flags=_TLA_FLAG), None, True
+    except SyntaxError:
+        # ast.parse alone accepts some AST-valid modules that compile
+        # rejects (a top-level 'return', 'break'/'continue' outside a
+        # loop, 'yield' outside a function, ...). Route them to the normal
+        # per-cell error path so the run settles with "invalid Python
+        # source" instead of leaving the kernel waiting for a done frame
+        # that never arrives.
+        return None, None, False
 
 
 def _lossless_json(value: Any):
@@ -438,8 +447,8 @@ async def _run_cell(code: str, run_id: str, namespaces: list[dict]) -> None:
             _flush_stream_proxies(run_id)
             tb = traceback.format_exception(type(exc), exc, exc.__traceback__)
             _emit({
-
-
+                "type": "error",
+                "id": run_id,
                 "ename": type(exc).__name__,
                 "evalue": str(exc),
                 "traceback": tb,

@@ -56,7 +56,7 @@ All row ids carry the `hy-sde-` prefix so they never clash with shipped rows (a 
 | Parameter | Meaning |
 |---|---|
 | `language` | `python` or `typescript`. |
-| `code` | Program source, run as an async function body (top-level `await`/`return`). |
+| `code` | Program source: for `typescript` an async-function body (top-level `await`/`return` work); for `python` a module (top-level `await` works, the last expression is the completion value — a top-level `return` is invalid Python and is reported as an `exception`). |
 | `session` | Optional non-empty id; calls sharing one id keep kernel state. Omit for a one-shot run in fresh state. |
 | `reset` | Discard the session's prior kernel state before this run (one reset instead of many retries). |
 

@@ -107,7 +107,7 @@ const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/
 export interface KernelRunRequest {
   /** Which kernel to run the program in (`'python'` presents as `language: python`, `'typescript'` as the SDK). */
   language: 'python' | 'typescript'
-  /** The program source: async-function body with top-level `await`/`return`. */
+  /** The program source. Typescript runs as an async-function body (top-level `await`/`return` work); python runs as a module (top-level `await` works, the last expression is the value). */
   code: string
   /** Optional persistent-kernel identity: runs sharing one keep kernel state. */
   sessionId?: string
@@ -539,7 +539,10 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     name: 'run_kernel_code',
     description: 'Execute model code in a persistent kernel and return its JSON completion '
       + 'and printed output. `language` picks the runtime: `python` or `typescript`. '
-      + '`code` runs as an async function body — top-level `await` and `return` work. '
+      + 'For `typescript` every cell runs as an async function body, so top-level '
+      + '`await` and `return` work. For `python` a cell runs as a module: top-level '
+      + '`await` works, statements persist into the session namespace, and the LAST '
+      + 'expression is the completion value (a top-level `return` is invalid Python). ' 
       + 'Carry the same non-empty `session` across calls to keep kernel state (variables, '
       + 'imports, working data); omit it for a one-shot run in fresh state. Pass '
       + '`reset: true` to discard the session\'s prior kernel state before this run '
