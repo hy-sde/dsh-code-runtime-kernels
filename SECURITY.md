@@ -4,7 +4,7 @@
 
 Please report security issues privately rather than in public issues.
 
-- **Email**: security@hy-sde.dev (preferred)
+- **Email**: hui.sde.us@gmail.com (preferred)
 - **GitHub**: use the repository's private vulnerability reporting form
   (Security → Report a vulnerability)
 
