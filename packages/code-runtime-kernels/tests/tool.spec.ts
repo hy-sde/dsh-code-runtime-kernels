@@ -9,7 +9,7 @@
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
-import { CallId } from '@deepseek-ai/dsh-llm'
+import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import {
@@ -30,7 +30,7 @@ let callCounter = 0
 function call(name: string, args: unknown) {
   return ctx.tools.execute({
     signal: testToolSignal,
-    callId: CallId(`it-${++callCounter}`),
+    callId: ToolCallId(`it-${++callCounter}`),
     name,
     arguments: args,
     agent: { session: { header: { id: 'sess-tool', cwd: process.cwd() } } } as never,
