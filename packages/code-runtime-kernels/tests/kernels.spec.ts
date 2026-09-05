@@ -49,7 +49,7 @@ async function withManager<T>(
 describe('persistent kernels — sessions', () => {
   for (const language of LANGUAGES) {
     it(`keeps state across calls in one session (${language})`, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         const seed = language === 'python'
           ? 'x = 41'
           : 'state.x = 41'
@@ -66,8 +66,8 @@ describe('persistent kernels — sessions', () => {
       })
     })
 
-        it(`reports executionCount and resets discard state (${language})`, async () => {
-      await withManager(async manager => {
+    it(`reports executionCount and resets discard state (${language})`, async () => {
+      await withManager(async (manager) => {
         await manager.run({ language, sessionId: 's', code: language === 'python' ? 'x = 1' : 'state.x = 1' })
         const reset = await manager.run({ language, sessionId: 's', reset: true, code: language === 'python' ? 'x' : 'return missingKernelVar' })
         expect(reset.error?.kind).toBe('exception')
@@ -75,7 +75,7 @@ describe('persistent kernels — sessions', () => {
     })
 
     it(`isolates state between session ids (${language})`, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         await manager.run({ language, sessionId: 'a', code: language === 'python' ? 'x = 7' : 'state.x = 7' })
         const fresh = await manager.run({ language, sessionId: 'b', code: language === 'python' ? 'x' : 'return missingKernelVar' })
         expect(fresh.error?.kind).toBe('exception')
@@ -83,7 +83,7 @@ describe('persistent kernels — sessions', () => {
     })
 
     it(`one-shot runs never share state (${language})`, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         const first = await manager.run({ language, code: language === 'python' ? 'x = 7\nx' : 'state.x = 7; return state.x' })
         expect(first.value).toBe(7)
         const second = await manager.run({ language, code: language === 'python' ? 'x' : 'return missingKernelVar' })
@@ -96,7 +96,7 @@ describe('persistent kernels — sessions', () => {
 describe('persistent kernels — binding re-entry', () => {
   for (const language of LANGUAGES) {
     it(`bridges host functions and surfaces typed rejections (${language})`, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         const call = language === 'python'
           ? 'await tools.add({"a": 3, "b": 4})'
           : 'return await tools.add({ a: 3, b: 4 })'
@@ -124,7 +124,7 @@ describe('persistent kernels — binding re-entry', () => {
 describe('persistent kernels — failure taxonomy', () => {
   for (const language of LANGUAGES) {
     it(`classifies a program exception (${language})`, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         const code = language === 'python' ? '1 / 0' : "throw new Error('boom')"
         const result = await manager.run({ language, code })
         expect(result.error?.kind).toBe('exception')
@@ -133,7 +133,7 @@ describe('persistent kernels — failure taxonomy', () => {
     })
 
     it(`classifies an invalid (non-lossless-JSON) completion (${language})`, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         const code = language === 'python'
           ? '{1, 2}'
           : 'const x = {}; x.self = x; return x'
@@ -143,7 +143,7 @@ describe('persistent kernels — failure taxonomy', () => {
     })
 
     it(`enforces the wall-clock budget as a timeout (${language})`, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         const code = language === 'python' ? 'while True:\n    pass' : 'await new Promise(() => {})'
         const result = await manager.run({
           language,
@@ -155,17 +155,17 @@ describe('persistent kernels — failure taxonomy', () => {
     })
 
     it(`aborts a run whose caller signal fires (${language})`, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         const controller = new AbortController()
         const pending = manager.run({ language, code: language === 'python' ? 'while True:\n    pass' : 'await new Promise(() => {})', signal: controller.signal })
-        setTimeout(() => controller.abort(new Error('caller gave up')), 80)
+        setTimeout(() => { controller.abort(new Error('caller gave up')) }, 80)
         const result = await pending
         expect(result.error?.kind).toBe('abort')
       })
     })
 
     it(`caps combined output at maxOutputBytes (${language})`, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         const code = language === 'python'
           ? "'x' * 200"
           : "return 'x'.repeat(200)"
@@ -173,10 +173,68 @@ describe('persistent kernels — failure taxonomy', () => {
         expect(result.error?.kind).toBe('output-limit')
       }, { maxOutputBytes: 64 })
     })
+
+    it(`recovers a session whose kernel died mid-flight (${language})`, async () => {
+      await withManager(async (manager) => {
+        const sessionId = `dead-${language}-${Math.random().toString(36).slice(2)}`
+        // The program kills the kernel process itself (a hard death, no `done`
+        // frame): the host sees the pipe close and classifies the run as
+        // killed, exactly like a spontaneous interpreter crash.
+        const killer = language === 'python'
+          ? 'import os, sys\nsys.stdout.flush()\nos._exit(137)'
+          : 'process.stdout.write("")\nprocess.exit(137)'
+        const dead = await manager.run({ language, sessionId, code: killer })
+        // A killed kernel surfaces as an abort with the exit message.
+        expect(dead.error?.kind).toBe('abort')
+        // The registry replaced the dead kernel and retried once; the next run
+        // on the SAME session must come back alive with fresh state.
+        const alive = await manager.run({
+          language,
+          sessionId,
+          code: language === 'python' ? '21 * 2' : 'return 21 * 2',
+        })
+        expect(alive.error).toBeUndefined()
+        expect(alive.value).toBe(42)
+      })
+    })
+
+    it(`spills the full output on an output overrun (${language})`, async () => {
+      await withManager(async (manager) => {
+        const spilled: string[] = []
+        const code = language === 'python'
+          ? "'x' * 200"
+          : "return 'x'.repeat(200)"
+        const result = await manager.run({ language, code }, async (content) => {
+          spilled.push(content)
+          return 'spill://kernel-output-1'
+        })
+        expect(result.error?.kind).toBe('output-limit')
+        expect(result.error?.message).toContain('full program output preserved at spill://kernel-output-1')
+        expect(spilled).toHaveLength(1)
+        expect(spilled[0]).toContain('[completion value]')
+        expect(spilled[0]).toContain('x'.repeat(200))
+      }, { maxOutputBytes: 64 })
+    })
+
+    it(`keeps the truncated result when the spill hook declines (${language})`, async () => {
+      await withManager(async (manager) => {
+        const called: string[] = []
+        const code = language === 'python'
+          ? "'x' * 200"
+          : "return 'x'.repeat(200)"
+        const result = await manager.run({ language, code }, async (content) => {
+          called.push(content)
+          return undefined
+        })
+        expect(result.error?.kind).toBe('output-limit')
+        expect(result.error?.message).not.toContain('preserved at')
+        expect(called).toHaveLength(1)
+      }, { maxOutputBytes: 64 })
+    })
   }
 
   it('uncaps output when within budget and surfaces a completion value', async () => {
-    await withManager(async manager => {
+    await withManager(async (manager) => {
       for (const language of LANGUAGES) {
         const result = await manager.run({
           language,
@@ -193,9 +251,9 @@ describe('persistent kernels — failure taxonomy', () => {
 describe('persistent kernels — async cells', () => {
   for (const language of LANGUAGES) {
     it(`runs top-level await (${language})`, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         const code = language === 'python'
-          ? "import asyncio\nr = await asyncio.sleep(0, 21)\nr * 2"
+          ? 'import asyncio\nr = await asyncio.sleep(0, 21)\nr * 2'
           : 'const v = await Promise.resolve(21)\nreturn v * 2'
         const result = await manager.run({ language, code })
         expect(result.error).toBeUndefined()

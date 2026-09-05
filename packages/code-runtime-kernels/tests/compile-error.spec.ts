@@ -27,7 +27,7 @@ describe('python compile-time errors settle the run (no hang)', () => {
 
   for (const [label, code] of cases) {
     it(`${label} → resolved exception error`, { timeout: 20000 }, async () => {
-      await withManager(async manager => {
+      await withManager(async (manager) => {
         const result = await manager.run({ language: 'python', code, sessionId: 'compile-error-case' })
         expect(result.error).toBeDefined()
         expect(result.error?.kind).toBe('exception')
@@ -37,7 +37,7 @@ describe('python compile-time errors settle the run (no hang)', () => {
   }
 
   it('valid statement code still completes after a compile-error cell in the same session', { timeout: 20000 }, async () => {
-    await withManager(async manager => {
+    await withManager(async (manager) => {
       const bad = await manager.run({ language: 'python', code: 'return 1', sessionId: 's-recover' })
       expect(bad.error).toBeDefined()
       const good = await manager.run({ language: 'python', code: 'x = 41', sessionId: 's-recover' })

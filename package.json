@@ -1,6 +1,6 @@
 {
   "name": "dsh-code-runtime-kernels",
-  "version": "0.1.0-rc.1",
+  "version": "0.1.2-rc.1",
   "private": true,
   "description": "Standalone public package: @hy-sde-org/dsh-code-runtime-kernels (the persistent Python + JavaScript kernel plugin for DeepSeek Harness).",
   "type": "module",

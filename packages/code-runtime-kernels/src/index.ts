@@ -12,7 +12,9 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { inspect } from 'node:util'
 import { Context } from '@deepseek-ai/cordis'
+import type { SaveTextSpill } from '@deepseek-ai/dsh-spill'
 import z from '@deepseek-ai/schemastery'
 import {
   DUNDER_MEMBER,
@@ -38,7 +40,7 @@ import { PYTHON_RUNNER } from './python/runner.ts'
 export const name = 'code-runtime-kernels'
 
 /** Services this plugin requires: the tool registry and the system-prompt builder. */
-export const inject = ['tools', 'systemPrompt'] as const
+export const inject = ['tools', 'systemPrompt']
 
 /**
  * Plugin config: which languages are enabled, and every execution cap
@@ -92,6 +94,11 @@ export const Config: z<Config> = z.object({
 /** Smallest cap that can represent the counted payloads: an empty logs array plus an empty JSON failure message. */
 const MIN_OUTPUT_BYTES = 4
 
+/** Whether a configured language names one of the two kernels this plugin spawns. */
+function isKernelLanguage(language: string): language is 'python' | 'typescript' {
+  return language === 'python' || language === 'typescript'
+}
+
 /** Constructor for a timeout-flavored abort reason, surfacing the budget in the result. */
 class RunTimeoutError extends Error {
   constructor(message: string) {
@@ -107,7 +114,11 @@ const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/
 export interface KernelRunRequest {
   /** Which kernel to run the program in (`'python'` presents as `language: python`, `'typescript'` as the SDK). */
   language: 'python' | 'typescript'
-  /** The program source. Typescript runs as an async-function body (top-level `await`/`return` work); python runs as a module (top-level `await` works, the last expression is the value). */
+  /**
+   * The program source. Typescript runs as an async-function body (top-level
+   * `await`/`return` work); python runs as a module (top-level `await` works,
+   * the last expression is the value).
+   */
   code: string
   /** Optional persistent-kernel identity: runs sharing one keep kernel state. */
   sessionId?: string
@@ -242,7 +253,7 @@ export class KernelManager {
       throw new Error('dsh-code-runtime-kernels: config.languages must not be empty')
     }
     for (const language of resolved.languages) {
-      if (language !== 'python' && language !== 'typescript') {
+      if (!isKernelLanguage(language)) {
         throw new Error(`dsh-code-runtime-kernels: unknown language ${JSON.stringify(language)}`)
       }
     }
@@ -269,8 +280,20 @@ export class KernelManager {
    * disposed manager, an invalid binding namespace). With a non-empty
    * `sessionId` the program runs in that session's persistent kernel and
    * `executionCount` is reported; `reset: true` discards prior state first.
+   *
+   * `onOutputLimit` is a best-effort spill hook called only when the run's
+   * output crosses `maxOutputBytes`: it receives the FULL captured program
+   * output (the same bytes that just overflowed the result budget) and may
+   * persist them somewhere recoverable. Returning a retrieval hint rewrites
+   * the `output-limit` message so the caller can recover the dropped tail;
+   * returning `undefined` (no backend, no owner, storage failure) keeps the
+   * truncated result untouched. The manager never awaits this beyond a
+   * best-effort `catch` — spill failure cannot fail the program.
    */
-  async run(request: KernelRunRequest): Promise<KernelRunResult> {
+  async run(
+    request: KernelRunRequest,
+    onOutputLimit?: (content: string) => Promise<string | undefined>,
+  ): Promise<KernelRunResult> {
     if (this.#disposed) throw new Error('dsh-code-runtime-kernels: run() after disposal')
     const registry = this.#registries.get(request.language)
     if (registry === undefined) {
@@ -301,7 +324,7 @@ export class KernelManager {
           signal: controller.signal,
         })
         : await this.#runOneShot(request.language, request.code, bindings, controller.signal)
-      return this.finalize(outcome, timedOut)
+      return await this.finalize(outcome, timedOut, onOutputLimit)
     } finally {
       clearTimeout(timer)
       request.signal?.removeEventListener('abort', onOuter)
@@ -327,7 +350,7 @@ export class KernelManager {
         PYTHONDONTWRITEBYTECODE: '1',
         DSH_KERNEL_CWD: process.cwd(),
       },
-      prefix: 'dsh-code-runtime-python',
+      prefix: 'dsh-code-runtime-kernels-python',
       idPrefix: 'py-',
       label: 'python kernel',
     }
@@ -374,7 +397,20 @@ export class KernelManager {
    * kernel survived to acknowledge it); everything else interrupted is an
    * abort; a died kernel is an abort unless the budget already owns the run.
    */
-  private finalize(outcome: KernelExecResult, timedOut: boolean): KernelRunResult {
+  /**
+   * Map a kernel outcome onto the failure taxonomy through the output ledger.
+   * Budget expiry owns a run that hit the wall clock (whether or not the
+   * kernel survived to acknowledge it); everything else interrupted is an
+   * abort; a died kernel is an abort unless the budget already owns the run.
+   *
+   * An `output-limit` outcome additionally consults `onOutputLimit` to spill
+   * the full captured output, best-effort (never awaited past a catch).
+   */
+  private async finalize(
+    outcome: KernelExecResult,
+    timedOut: boolean,
+    onOutputLimit?: (content: string) => Promise<string | undefined>,
+  ): Promise<KernelRunResult> {
     const ledger = this.#ledgerFactory()
     const logs = outcome.logs.map(entry => entry.text)
     if (timedOut) {
@@ -398,7 +434,37 @@ export class KernelManager {
     const result = outcome.value === undefined
       ? ledger.success(logs)
       : ledger.success(logs, outcome.value)
-    return { ...result, ...outcome.executionCount !== undefined ? { executionCount: outcome.executionCount } : {} }
+    const settled: KernelRunResult = {
+      ...result,
+      ...outcome.executionCount !== undefined ? { executionCount: outcome.executionCount } : {},
+    }
+    if (settled.error?.kind === 'output-limit' && onOutputLimit !== undefined) {
+      // The overflow was either captured logs or (for a clean run) a
+      // completion value too large to survive the JSON serialization budget —
+      // spill whatever full text we still hold so the caller can recover it.
+      let valueText: string | undefined
+      if (outcome.value !== undefined) {
+        try {
+          valueText = JSON.stringify(outcome.value)
+        } catch {
+          // JSON.stringify rejected the value (circular reference, exotic
+          // object); a structural inspection is the best text we still have.
+          valueText = inspect(outcome.value, { depth: 8, maxArrayLength: 200, breakLength: 100 })
+        }
+      }
+      const spillContent = valueText === undefined
+        ? logs.join('\n')
+        : `${logs.join('\n')}\n[completion value]\n${valueText}`
+      try {
+        const hint = await onOutputLimit(spillContent)
+        if (hint !== undefined && hint.length > 0) {
+          return { ...settled, error: { ...settled.error, message: `${settled.error.message} — full program output preserved at ${hint}` } }
+        }
+      } catch {
+        // Best-effort by contract: a spill failure keeps the truncated result.
+      }
+    }
+    return settled
   }
 
   /** Reject malformed binding globals or typed-error declarations as contract misuse. */
@@ -521,7 +587,7 @@ export function presentRunKernelCodeResult(_args: RunKernelCodeArgs, result: Too
  * the plugin), and register `run_kernel_code` against `ctx.tools` so a plain
  * upstream harness exposes the persistent kernels with zero source changes.
  */
-export async function apply(ctx: Context, config: Config): Promise<void> {
+export function apply(ctx: Context, config: Config): void {
   const toolTimeoutMs = config.toolTimeoutMs ?? 30_000
   if (toolTimeoutMs > MAX_TIMER_DELAY_MS) {
     throw new Error(`dsh-code-runtime-kernels: config.toolTimeoutMs must be no greater than ${MAX_TIMER_DELAY_MS}`)
@@ -542,7 +608,7 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       + 'For `typescript` every cell runs as an async function body, so top-level '
       + '`await` and `return` work. For `python` a cell runs as a module: top-level '
       + '`await` works, statements persist into the session namespace, and the LAST '
-      + 'expression is the completion value (a top-level `return` is invalid Python). ' 
+      + 'expression is the completion value (a top-level `return` is invalid Python). '
       + 'Carry the same non-empty `session` across calls to keep kernel state (variables, '
       + 'imports, working data); omit it for a one-shot run in fresh state. Pass '
       + '`reset: true` to discard the session\'s prior kernel state before this run '
@@ -576,13 +642,34 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
       presentationMeta: (_args, value) => runKernelCodeMeta(value as RunKernelCodeValue),
     },
     async execute(args: RunKernelCodeArgs, exec) {
+      // Best-effort recovery for output overruns: persist the full captured
+      // output through ctx.spillStore so an oversized dataframe dump survives
+      // the result budget. No store, no session owner, or a storage failure
+      // leaves the truncated `output-limit` result intact.
+      const sessionId = exec.agent?.session.header.id
+      const spillStore = ctx.get('spillStore')
+      const onOutputLimit = async (content: string): Promise<string | undefined> => {
+        if (sessionId === undefined || spillStore === undefined) return undefined
+        const save: SaveTextSpill = {
+          owner: { sessionId },
+          source: { toolName: 'run_kernel_code', callId: exec.callId, label: 'kernel-output' },
+          suggestedName: 'kernel-output.txt',
+          content,
+        }
+        try {
+          return (await spillStore.saveText(save)).retrievalHint
+        } catch (error: unknown) {
+          ctx.logger.warn(`code-runtime-kernels: spill of ${content.length} chars failed (${String(error)}); keeping the truncated result`)
+          return undefined
+        }
+      }
       const result = await manager.run({
         language: args.language,
         code: args.code,
         ...args.session !== undefined ? { sessionId: args.session } : {},
         ...args.reset !== undefined ? { reset: args.reset } : {},
         signal: exec.signal,
-      })
+      }, onOutputLimit)
       return result
     },
     presentCall: presentRunKernelCodeCall,
@@ -590,4 +677,3 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
   })
   ctx.tools.register(tool)
 }
-

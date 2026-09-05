@@ -18,8 +18,9 @@ packages/code-runtime-kernels/
     python/runner.ts   embedded self-contained Python kernel (stdlib only)
     nodejs/runner.ts   compiled self-contained Node.js kernel (builtins only)
     index.ts            plugin: config, KernelManager, run_kernel_code tool
-  tests/            kernels.spec.ts + tool.spec.ts (real subprocesses,
-                    36 tests)
+  tests/            kernels.spec.ts + compile-error.spec.ts +
+                    process-group.spec.ts + tool.spec.ts (real
+                    subprocesses, 51 tests)
   cordis.patch.yml  the bundle row deployments mount
 ```
 

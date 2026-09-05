@@ -20,7 +20,7 @@
  * persist; tool bindings are bridged through wire frames that the host
  * resolves against the CURRENT run's namespaces.
  *
- * @module @deepseek-ai/dsh-code-runtime-python/src/runner
+ * @module @hy-sde-org/dsh-code-runtime-kernels/src/python/runner
  */
 
 export const PYTHON_RUNNER = String.raw`"""DSH Python kernel runner (embedded).

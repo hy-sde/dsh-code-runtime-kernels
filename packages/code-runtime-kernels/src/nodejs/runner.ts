@@ -20,7 +20,7 @@
  *    scoped to that cell (async-function body), exactly like a Node REPL
  *    line that uses top-level `await` — use `state` or the global object to
  *    persist values.
- * @module @deepseek-ai/dsh-code-runtime-nodejs/src/runner
+ * @module @hy-sde-org/dsh-code-runtime-kernels/src/nodejs/runner
  */
 
 /** Host -> kernel messages this runner honors (see protocol.ts for the full contract). */
@@ -47,9 +47,10 @@ interface ReplyMessage {
   name?: string
 }
 import { format } from 'node:util'
+import { compileFunction } from 'node:vm'
 
 /** Global-object accessor for program-scope globals keyed by identifier. */
-const g: Record<string, unknown> = globalThis as unknown as Record<string, unknown>
+const g: Record<string, unknown> = globalThis
 
 /** The original stdout sink, captured before suppression of program writes. */
 const rawStdout: NodeJS.WriteStream = process.stdout
@@ -204,7 +205,6 @@ async function runCell(code: string, run: ActiveRun, namespaces: ExecNamespaceDe
   // Construction can itself throw (a cell with invalid JavaScript syntax);
   // that is a program error, not a reason to lose the kernel, so it settles
   // the run instead of letting the exception escape and kill the runner.
-  // eslint-disable-next-line typescript/no-implied-eval -- persistent eval kernel by design
   let done = false
   const finish = (frame: object): void => {
     if (done) return
@@ -213,7 +213,10 @@ async function runCell(code: string, run: ActiveRun, namespaces: ExecNamespaceDe
   }
   let program: (...args: unknown[]) => unknown
   try {
-    program = new Function('return (async () => {\n' + code + '\n})()') as (...args: unknown[]) => unknown
+    // `compileFunction` is V8's Function-constructor path without the implied-eval
+    // surface: the same function-body semantics (including a `this` bound at
+    // call time), compilable up front so a syntax error settles the run.
+    program = compileFunction('return (async () => {\n' + code + '\n})()') as (...args: unknown[]) => unknown
   } catch (error: unknown) {
     const message = messageOf(error)
     emit({ type: 'error', id: run.id, ename: 'SyntaxError', evalue: message, traceback: [] })

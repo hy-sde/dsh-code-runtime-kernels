@@ -107,7 +107,7 @@ export function nodejsKernelProfile(command: string): KernelRuntimeProfile {
     command,
     argvPrefix: ['--no-warnings'],
     runnerPath: RUNNER_PATH,
-    prefix: 'dsh-code-runtime-nodejs',
+    prefix: 'dsh-code-runtime-kernels-nodejs',
     idPrefix: 'js-',
     label: 'nodejs kernel',
   }
@@ -126,6 +126,48 @@ function tryMessageOf(error: unknown): string {
     return String(error.message)
   }
   return String(error)
+}
+
+/**
+ * True when `pid` is safe to use as a process-group target for `kill(2)`.
+ *
+ * `process.kill(-pid, …)` is a group signal, and the degenerate targets are
+ * catastrophic rather than merely useless: `-0` signals *our own* process group
+ * (the host would kill itself along with the whole terminal job) and `-1`
+ * signals every process the caller is permitted to signal. Both must be
+ * rejected before the negation is applied. Ported from oh-my-pi
+ * (`packages/coding-agent/src/eval/kernel-base.ts`), MIT.
+ */
+export function isSignalableProcessGroup(pid: number | undefined): pid is number {
+  return typeof pid === 'number' && Number.isInteger(pid) && pid > 1
+}
+
+/**
+ * Signal the whole process group led by `pid`, returning true when a signal
+ * was actually delivered.
+ *
+ * Kernels are spawned with `detached: true` on POSIX (see the spawn options in
+ * {@link KernelHost.startKernel}), so the runner becomes the leader of its own
+ * session and process group. Signalling only the direct PID therefore leaves
+ * anything the runner itself spawned behind, and those orphans keep the
+ * kernel's pipes open for the remainder of the host's lifetime. This mirrors
+ * the #7714 fix in oh-my-pi: sweep the whole group before falling back to
+ * direct-PID escalation.
+ *
+ * Windows has no process groups, so this is a no-op there and callers keep
+ * relying on the direct-PID kill.
+ */
+export function killProcessGroup(pid: number | undefined, signal: NodeJS.Signals): boolean {
+  if (process.platform === 'win32') return false
+  if (!isSignalableProcessGroup(pid)) return false
+  try {
+    process.kill(-pid, signal)
+    return true
+  } catch {
+    // ESRCH: the group is already gone, which is the outcome we wanted anyway.
+    // EPERM: not ours to signal. Neither is worth failing a shutdown over.
+    return false
+  }
 }
 
 /**
@@ -242,14 +284,19 @@ export class KernelHost {
     const runnerArg = stagedPath ?? profile.runnerPath
     if (runnerArg !== undefined) argv.push(runnerArg)
 
-    // --no-warnings for the Node runner is statically safe: a development
+    // `--no-warnings` for the Node runner is statically safe: a development
     // spawn of the .ts kernel would otherwise leak the type-stripping
     // ExperimentalWarning into the captured stderr. Python gets unfiltered
     // stdout via -u plus PYTHONUNBUFFERED/PYTHONIOENCODING.
+    // `detached: true` on POSIX calls setsid(2), making the runner a session
+    // leader: anything it spawns stays in ITS process group, so a shutdown can
+    // sweep the whole tree via killProcessGroup (the #7714 orphan fix) instead
+    // of leaving grandchildren holding the kernel's pipes open.
     const proc = spawn(profile.command, argv, {
       cwd: config.cwd,
       env: { ...(config.env ?? process.env), ...profile.env },
       stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
       windowsHide: true,
     })
     if (proc.pid === undefined) proc.unref()
@@ -402,9 +449,15 @@ export class KernelHost {
     const termTimer = setTimeout(() => {
       if (run.killed || !this.#alive) return
       try { this.#proc.kill('SIGTERM') } catch { /* gone */ }
+      // The runner leads its own process group (detached spawn), so the
+      // direct-PID signal never reaches anything it spawned. Sweep the group.
+      killProcessGroup(this.#proc.pid, 'SIGTERM')
       const killTimer = setTimeout(() => {
         if (!run.killed) run.killed = true
         try { this.#proc.kill('SIGKILL') } catch { /* gone */ }
+        // Always finish an attempted group shutdown with a SIGKILL sweep: the
+        // leader exiting after SIGTERM does not prove its descendants did.
+        killProcessGroup(this.#proc.pid, 'SIGKILL')
       }, this.#interruptEscalationMs)
       killTimer.unref()
       void run.done.then(() => { clearTimeout(killTimer) })
@@ -433,18 +486,27 @@ export class KernelHost {
     })
     if (await Promise.race([exited.then(() => 'exited' as const), grace()]) === 'exited') return { confirmed: true }
     try { this.#proc.kill('SIGTERM') } catch { /* gone */ }
+    // The runner leads its own process group (detached spawn), so the
+    // direct-PID signal never reaches anything it spawned. Sweep the group too.
+    killProcessGroup(this.#proc.pid, 'SIGTERM')
     if (await Promise.race([exited.then(() => 'exited' as const), grace()]) === 'exited') return { confirmed: true }
     try { this.#proc.kill('SIGKILL') } catch { /* gone */ }
+    // The leader exiting after SIGTERM does not prove its descendants did.
+    // Always finish an attempted group shutdown with a SIGKILL sweep.
+    killProcessGroup(this.#proc.pid, 'SIGKILL')
     await exited.catch(() => {})
     return { confirmed: false }
   }
-
   /** Termination path for a startup that never completed. */
   private async killForFailedStart(_reason: string): Promise<void> {
     this.#alive = false
     this.#disposed = true
     try { this.#proc.kill('SIGTERM') } catch { /* gone */ }
-    const timer = setTimeout(() => { try { this.#proc.kill('SIGKILL') } catch { /* gone */ } }, this.#shutdownGraceMs)
+    killProcessGroup(this.#proc.pid, 'SIGTERM')
+    const timer = setTimeout(() => {
+      try { this.#proc.kill('SIGKILL') } catch { /* gone */ }
+      killProcessGroup(this.#proc.pid, 'SIGKILL')
+    }, this.#shutdownGraceMs)
     timer.unref()
     await this.#exited.catch(() => {})
     clearTimeout(timer)
