@@ -1,0 +1,35 @@
+{
+  "name": "dsh-code-runtime-kernels",
+  "version": "0.1.2-rc.1",
+  "private": true,
+  "description": "Standalone public package: @hy-sde-org/dsh-code-runtime-kernels (the persistent Python + JavaScript kernel plugin for DeepSeek Harness).",
+  "type": "module",
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "scripts": {
+    "build": "pnpm -r --filter './packages/*' build",
+    "check": "pnpm -r --filter './packages/*' check",
+    "test": "pnpm -r --filter './packages/*' test",
+    "pack:all": "pnpm -r --filter './packages/*' pack",
+    "release:check": "bash scripts/release-public.sh --check",
+    "release:publish": "bash scripts/release-public.sh --publish"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@types/node": "^24.13.3",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  },
+  "keywords": [
+    "deepseek",
+    "agent",
+    "harness",
+    "dsh-plugin",
+    "code-runtime",
+    "persistent",
+    "kernel",
+    "python",
+    "javascript"
+  ]
+}

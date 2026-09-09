@@ -1,0 +1,34 @@
+# @hy-sde-org/dsh-code-runtime-kernels — persistent Python + JavaScript
+# kernels for DeepSeek Harness, delivered as ONE self-contained plugin row.
+#
+# The kernel code is executed in real python3/node subprocesses (one long-lived
+# subprocess per `session`), so no worker-thread seam or harness source change
+# is involved: the tool registers on the host's `tools` service exactly like
+# any other shipped tool row. This is process confinement, not a security
+# boundary — model code has bash-equivalent trust.
+#
+# All row ids carry the `hy-sde-` prefix to avoid clashing with any shipped
+# row of the same name (a duplicate loader id fails the boot).
+#
+# Override per deployment (e.g. pin the interpreter paths, shrink the wall
+# clock) by patching the row by id:
+#
+#   - id: hy-sde-kernels
+#     config:
+#       pythonPath: /usr/local/bin/python3
+#       maxWallMs: 120000
+#
+# To disable one language, set `languages: ['python']` (or
+# `['typescript']`); a disabled language is refused at call time.
+- insert:
+    - id: hy-sde-kernels
+      name: '@hy-sde-org/dsh-code-runtime-kernels'
+      config:
+        languages: ['python', 'typescript']
+        maxWallMs: 600000
+        maxOutputBytes: 67108864
+        sessionIdleMs: 0
+        interruptEscalationMs: 5000
+        startupTimeoutMs: 15000
+        shutdownGraceMs: 1000
+        toolTimeoutMs: 30000
