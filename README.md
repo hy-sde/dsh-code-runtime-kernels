@@ -33,7 +33,7 @@ Design decisions:
   plugin owns `run_kernel_code(language, code, session?, reset?)` and reuses the
   seam's result vocabulary (`error.kind` of `exception`/`timeout`/`abort`/
   `worker-exit`/`invalid-output`/`output-limit`), exactly like the sibling
-  [`dsh-tool-ast`](https://github.com/hy-sde/dsh-tool-ast) owns `ast_grep`/
+  [`dsh-tool-ast`](https://github.com/hy-sde/dsh-plugins/tree/main/dsh-tool-ast) owns `ast_grep`/
   `ast_edit`.
 - **Snapshots, not just sessions.** Each successful run persists the session
   namespace (stdlib `pickle`/`marshal` on the Python side, V8 serialization on
