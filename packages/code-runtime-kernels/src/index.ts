@@ -776,7 +776,7 @@ export function apply(ctx: Context, config: Config): void {
         if (sessionId === undefined || spillStore === undefined) return undefined
         const save: SaveTextSpill = {
           owner: { sessionId },
-          source: { toolName: 'run_kernel_code', callId: exec.callId, label: 'kernel-output' },
+          source: { kind: 'tool', toolName: 'run_kernel_code', callId: exec.callId, label: 'kernel-output' },
           suggestedName: 'kernel-output.txt',
           content,
         }
