@@ -9,7 +9,7 @@
  * @module @hy-sde-org/dsh-code-runtime-kernels/src/core/protocol
  */
 
-import type { CodeBindingErrorClass, CodeJsonValue } from '@deepseek-ai/dsh-code-runtime'
+import type { PtcBindingErrorClass, PtcJsonValue } from '@deepseek-ai/dsh-ptc-runtime'
 
 /** One binding global materialized inside the kernel for a run. */
 export interface KernelNamespaceDescriptor {
@@ -18,7 +18,7 @@ export interface KernelNamespaceDescriptor {
   /** The callable member names; functions themselves stay host-side. */
   names: string[]
   /** Optional typed-rejection contract (name + member-name property). */
-  errorClass?: CodeBindingErrorClass
+  errorClass?: PtcBindingErrorClass
 }
 
 /**
@@ -62,7 +62,7 @@ export interface KernelReplyMessage {
   seq: number
   ok: boolean
   /** The lossless-JSON resolution, present when `ok` is true. */
-  value?: CodeJsonValue
+  value?: PtcJsonValue
   /** The rejection message, present when `ok` is false. */
   message?: string
   /** The rejected member name, surfaced onto the program-side error. */
@@ -108,7 +108,7 @@ export interface CallFrame {
   /** The member name within the namespace. */
   name: string
   /** The single argument, already lossless JSON. */
-  args: CodeJsonValue
+  args: PtcJsonValue
 }
 
 /** Kernel -> host: an uncaught program exception. */
@@ -130,7 +130,7 @@ export interface DoneFrame {
   id: string
   status: 'ok' | 'error'
   /** The lossless-JSON completion value, present on a clean run with one. */
-  value?: CodeJsonValue
+  value?: PtcJsonValue
   /** The session's execution count after this run; informational. */
   executionCount?: number
   /** True when the host interrupted the run. */

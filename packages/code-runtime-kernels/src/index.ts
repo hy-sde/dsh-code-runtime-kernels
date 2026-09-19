@@ -23,13 +23,13 @@ import {
   PORTABLE_RESERVED_WORDS,
   RESERVED_BINDING_GLOBALS,
   RESERVED_ERROR_MEMBERS,
-} from '@deepseek-ai/dsh-code-runtime'
+} from '@deepseek-ai/dsh-ptc-runtime'
 import type {
-  CodeBindingNamespace,
-  CodeJsonValue,
-  CodeRunFailure,
-  CodeRunResult,
-} from '@deepseek-ai/dsh-code-runtime'
+  PtcBindingNamespace,
+  PtcJsonValue,
+  PtcRunFailure,
+  PtcRunResult,
+} from '@deepseek-ai/dsh-ptc-runtime'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import type { TerminalCallView, TerminalResultView, ToolResult } from '@deepseek-ai/dsh-tools'
 import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
@@ -163,7 +163,7 @@ class RunTimeoutError extends Error {
   }
 }
 
-/** The language-portable identifier subset (see `CodeBindingNamespace.global`). */
+/** The language-portable identifier subset (see `PtcBindingNamespace.global`). */
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/
 
 /** One run request against the persistent kernels; `sessionId`/`reset` mirror the seam's persistence contract. */
@@ -183,16 +183,16 @@ export interface KernelRunRequest {
   /** Abort the run host-side; in-flight binding calls are the caller's to settle. */
   signal?: AbortSignal
   /** Optional host functions exposed to the program, one global object per namespace. */
-  bindings?: CodeBindingNamespace[]
+  bindings?: PtcBindingNamespace[]
 }
 
 /**
  * The outcome vocabulary of `run_kernel_code` and {@link KernelManager.run}:
  * the code-execution seam's result envelope plus the session execution count
- * (upstream's `CodeRunResult` has no persistent-session fields, so this plugin
+ * (upstream's `PtcRunResult` has no persistent-session fields, so this plugin
  * owns the additive `executionCount` surface).
  */
-export type KernelRunResult = CodeRunResult & { executionCount?: number }
+export type KernelRunResult = PtcRunResult & { executionCount?: number }
 
 /**
  * Outer-output ledger for one run: admits log entries, the completion value,
@@ -226,7 +226,7 @@ class OutputLedger {
   }
 
   /** Finalize a successful absent-or-JSON completion against the combined cap. */
-  success(logs: string[], value?: CodeJsonValue): CodeRunResult {
+  success(logs: string[], value?: PtcJsonValue): PtcRunResult {
     const clipped = this.clipLogs(logs)
     if (value === undefined) return { logs: clipped }
     const valueBytes = this.compactJsonBytes(value)
@@ -235,14 +235,14 @@ class OutputLedger {
   }
 
   /** Finalize a failure diagnostic, with output-limit taking precedence over the cap. */
-  failure(logs: string[], error: CodeRunFailure): CodeRunResult {
+  failure(logs: string[], error: PtcRunFailure): PtcRunResult {
     const clipped = this.clipLogs(logs)
     if (this.textBytes(error.message) <= this.maxBytes) return { logs: clipped, error }
     return this.limit(clipped)
   }
 
   /** Build the explicit output-limit failure while retaining fitting logs. */
-  limit(logs: string[]): CodeRunResult {
+  limit(logs: string[]): PtcRunResult {
     const fullMessage = `outer output exceeded ${this.maxBytes} bytes`
     const messageBytes = this.textBytes(fullMessage)
     const retained: string[] = []
@@ -256,7 +256,7 @@ class OutputLedger {
     return { logs: retained, error: { kind: 'output-limit', message: fullMessage } }
   }
 
-  private compactJsonBytes(value: CodeJsonValue): number | undefined {
+  private compactJsonBytes(value: PtcJsonValue): number | undefined {
     let text: string
     try {
       text = JSON.stringify(value)
@@ -270,7 +270,7 @@ class OutputLedger {
 /**
  * Owns the two persistent kernel registries and maps one `KernelRunRequest`
  * onto the same outcome vocabulary as the code-execution seam
- * (`CodeRunResult` + `CodeRunFailure` kinds), so programs behave like the
+ * (`PtcRunResult` + `PtcRunFailure` kinds), so programs behave like the
  * seam's persistent backends. Exported for programmatic use and the tests; the
  * model-facing surface is the `run_kernel_code` tool registered in `apply`.
  */
@@ -500,7 +500,7 @@ export class KernelManager {
   async #runOneShot(
     language: 'python' | 'typescript',
     code: string,
-    bindings: CodeBindingNamespace[],
+    bindings: PtcBindingNamespace[],
     signal: AbortSignal,
   ): Promise<KernelExecResult> {
     const kernel = await this.#startKernel(language)
@@ -590,8 +590,8 @@ export class KernelManager {
   }
 
   /** Reject malformed binding globals or typed-error declarations as contract misuse. */
-  private validateBindings(bindings: CodeBindingNamespace[]): CodeBindingNamespace[] {
-    const seen = new Map<string, CodeBindingNamespace>()
+  private validateBindings(bindings: PtcBindingNamespace[]): PtcBindingNamespace[] {
+    const seen = new Map<string, PtcBindingNamespace>()
     for (const namespace of bindings) {
       if (!IDENTIFIER.test(namespace.global) || PORTABLE_RESERVED_WORDS.has(namespace.global)) {
         throw new Error(`dsh-code-runtime-kernels: binding global ${JSON.stringify(namespace.global)} is not a usable identifier`)
@@ -662,7 +662,7 @@ function renderResult(value: RunKernelCodeValue): string {
 /** The persisted `presentationMeta` projection of one run result (a structurally-literal type so it stays JSON-value-assignable). */
 export type RunKernelCodeMeta = {
   summary: string
-  value?: CodeJsonValue
+  value?: PtcJsonValue
   error?: { kind: string; message: string }
   executionCount?: number
   logs: string[]
@@ -756,7 +756,7 @@ export function apply(ctx: Context, config: Config): void {
             type: 'object',
             additionalProperties: false,
             properties: {
-              kind: { type: 'string', enum: ['exception', 'timeout', 'abort', 'worker-exit', 'invalid-output', 'output-limit'], required: true, description: 'The failure class.' },
+              kind: { type: 'string', enum: ['exception', 'timeout', 'abort', 'worker-exit', 'invalid-output', 'output-limit', 'protocol', 'sandbox-unavailable'], required: true, description: 'The failure class.' },
               message: { type: 'string', required: true, description: 'Model-feedable failure detail.' },
             },
           },

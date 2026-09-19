@@ -11,7 +11,7 @@
 
 import { randomUUID } from 'node:crypto'
 import { rmSync } from 'node:fs'
-import type { CodeBindingNamespace } from '@deepseek-ai/dsh-code-runtime'
+import type { PtcBindingNamespace } from '@deepseek-ai/dsh-ptc-runtime'
 import type { KernelExecResult, KernelHost } from './kernel.ts'
 import type { SnapshotSpec } from './protocol.ts'
 
@@ -91,7 +91,7 @@ export class SessionRegistry {
   async executeOnSession(
     sessionId: string,
     code: string,
-    bindings: CodeBindingNamespace[],
+    bindings: PtcBindingNamespace[],
     options: SessionRunOptions = {},
   ): Promise<KernelExecResult> {
     if (this.#disposed) {
@@ -203,7 +203,7 @@ export class SessionRegistry {
     session: KernelSession,
     sessionId: string,
     code: string,
-    bindings: CodeBindingNamespace[],
+    bindings: PtcBindingNamespace[],
     options: SessionRunOptions,
   ): Promise<KernelExecResult> {
     if (options.reset === true) {
@@ -258,7 +258,7 @@ export class SessionRegistry {
     kernel: KernelHost,
     sessionId: string,
     code: string,
-    bindings: CodeBindingNamespace[],
+    bindings: PtcBindingNamespace[],
     options: SessionRunOptions,
   ): Promise<KernelExecResult> {
     const snapshot = this.#config.snapshot?.(sessionId)

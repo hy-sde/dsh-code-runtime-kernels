@@ -9,7 +9,7 @@
  */
 
 import { afterEach, describe, expect, it } from 'vitest'
-import type { CodeBindingNamespace } from '@deepseek-ai/dsh-code-runtime'
+import type { PtcBindingNamespace } from '@deepseek-ai/dsh-ptc-runtime'
 import { KernelManager } from '../src/index.ts'
 import { cleanTempSnapshotDirs, tempSnapshotDir } from './test-util.ts'
 
@@ -28,7 +28,7 @@ afterEach(() => {
 })
 
 /** Host functions bridged into every kernel as the `tools` namespace (one args bundle per call, per the seam). */
-const TOOLS_NAMESPACE: CodeBindingNamespace = {
+const TOOLS_NAMESPACE: PtcBindingNamespace = {
   global: 'tools',
   functions: {
     add: async (args: unknown) => {
