@@ -499,7 +499,11 @@ export class KernelHost {
     return run.done
   }
 
-  /** Gracefully shut down: `exit` frame, then SIGTERM, then SIGKILL; waits for exit. */
+  /**
+   * Gracefully shut down: `exit` frame, then SIGTERM, then SIGKILL for the
+   * leader, and always an unconditional SIGKILL sweep of the leader's process
+   * group (a leader exit does not prove its descendants exited); waits for exit.
+   */
   async shutdown(): Promise<{ confirmed: boolean }> {
     if (this.#disposed) { await this.#whenExited() ; return { confirmed: true } }
     this.#alive = false
@@ -516,18 +520,24 @@ export class KernelHost {
       const timer = setTimeout(() => { resolve('timeout') }, this.#shutdownGraceMs)
       timer.unref()
     })
-    if (await Promise.race([exited.then(() => 'exited' as const), grace()]) === 'exited') return { confirmed: true }
-    try { this.#proc.kill('SIGTERM') } catch { /* gone */ }
-    // The runner leads its own process group (detached spawn), so the
-    // direct-PID signal never reaches anything it spawned. Sweep the group too.
-    killProcessGroup(this.#proc.pid, 'SIGTERM')
-    if (await Promise.race([exited.then(() => 'exited' as const), grace()]) === 'exited') return { confirmed: true }
-    try { this.#proc.kill('SIGKILL') } catch { /* gone */ }
-    // The leader exiting after SIGTERM does not prove its descendants did.
-    // Always finish an attempted group shutdown with a SIGKILL sweep.
+    let outcome: 'exited' | 'timeout' = await Promise.race([exited.then(() => 'exited' as const), grace()])
+    if (outcome !== 'exited') {
+      try { this.#proc.kill('SIGTERM') } catch { /* gone */ }
+      // The runner leads its own process group (detached spawn), so the
+      // direct-PID signal never reaches anything it spawned. Sweep the group too.
+      killProcessGroup(this.#proc.pid, 'SIGTERM')
+      outcome = await Promise.race([exited.then(() => 'exited' as const), grace()])
+    }
+    if (outcome !== 'exited') {
+      try { this.#proc.kill('SIGKILL') } catch { /* gone */ }
+    }
+    // A confirmed leader exit does not prove its descendants exited (a child
+    // may ignore TERM and hold the pipes), so an attempted shutdown always
+    // finishes with a SIGKILL sweep of the leader's group (omp c5aa69d322).
     killProcessGroup(this.#proc.pid, 'SIGKILL')
+    if (outcome !== 'exited') outcome = await Promise.race([exited.then(() => 'exited' as const), grace()])
     await exited.catch(() => {})
-    return { confirmed: false }
+    return { confirmed: outcome === 'exited' }
   }
   /** Termination path for a startup that never completed. */
   private async killForFailedStart(_reason: string): Promise<void> {
