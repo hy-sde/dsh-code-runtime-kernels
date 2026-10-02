@@ -10,7 +10,7 @@ import type { InvariantInstaller } from '@deepseek-ai/dsh-invariants'
 const PACKAGE_NAME = '@hy-sde-org/dsh-code-runtime-kernels'
 
 /** Cordis companion plugin name. */
-export const name = 'code-runtime-nodejs-invariant'
+export const name = 'code-runtime-kernels-invariant'
 /** Service required before the companion can reserve package ownership. */
 export const inject = ['invariants']
 
