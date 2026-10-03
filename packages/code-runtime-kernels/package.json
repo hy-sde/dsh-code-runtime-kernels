@@ -1,6 +1,6 @@
 {
   "name": "@hy-sde-org/dsh-code-runtime-kernels",
-  "version": "0.2.0-rc.2",
+  "version": "0.2.0-rc.2.1",
   "description": "The run_kernel_code tool for DeepSeek Harness: persistent Python and JavaScript kernels (a long-lived python3/node subprocess per session, sharing a core host driver) \u2014 a standalone plugin with no upstream harness changes required.",
   "type": "module",
   "main": "./dist/index.js",
