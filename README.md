@@ -1,3 +1,9 @@
+<!-- MIRROR-NOTE:START -->
+> [!NOTE]
+> 📦 This plugin lives in the [**dsh-plugins**](https://github.com/hy-sde/dsh-plugins) monorepo — file issues & pull requests there.
+> npm: [`@hy-sde-org/dsh-code-runtime-kernels`](https://www.npmjs.com/package/@hy-sde-org/dsh-code-runtime-kernels)
+<!-- MIRROR-NOTE:END -->
+
 # dsh-code-runtime-kernels
 
 **Persistent Python + JavaScript kernels for DeepSeek Harness** — a standalone
