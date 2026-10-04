@@ -9,11 +9,11 @@ Two long-lived kernel subprocesses share one host driver:
 - **Python** — a long-lived `python3` subprocess running a [self-contained kernel](./src/python/runner.ts) (standard library only — no venv, no pip). Module-level variables and one asyncio event loop persist across cells; top-level `await` works; the last expression is the cell's value.
 - **JavaScript** — a long-lived `node` subprocess running a [self-contained kernel](./src/nodejs/runner.ts) (Node builtins only). A persistent `state` object plus the process-global object carry values across cells; every cell runs as an async function body, so top-level `await` and `return` work; `return <json>` carries the completion value.
 
-The wire protocol, kernel host driver (spawn + handshake, serialized writes, hostile-peer parsing, SIGINT with SIGTERM/SIGKILL escalation, shutdown-to-exit), session registry, binding validation, and output ledger are shared (`src/core/`), so both languages behave identically.
+The wire protocol, kernel host driver (spawn + handshake, serialized writes, hostile-peer parsing, SIGINT with SIGTERM/SIGKILL escalation, stdin pipe-failure settlement, shutdown-to-exit), session registry, binding validation, and output ledger are shared (`src/core/`), so both languages behave identically.
 
 **Namespace snapshots.** After every successfully settled run, the session's kernel namespace is snapshotted to disk (atomic temp-file-and-rename, per-entry + combined byte caps) and a fresh kernel for the session restores it once — so state survives a model cell that kills the kernel, an idle-reaped session, and a full plugin restart. The first run after a restore logs what was revived and what could not be (unpicklable entries are named, never silently dropped). `reset: true` deletes the snapshot so discarded state cannot sneak back; `snapshot: false` disables persistence entirely.
 
-This is **process confinement, not a security boundary**: program source has bash-equivalent trust, exactly like the harness's own `process`-isolated backends. The driver's job is robustness — a forged frame never crashes the host, an unresponsive kernel is graded up to termination — not isolation.
+This is **process confinement, not a security boundary**: program source has bash-equivalent trust, exactly like the harness's own `process`-isolated backends. The driver's job is robustness — a forged frame never crashes the host, a failed write to a dead kernel's stdin settles the in-flight run as killed and retires the kernel (the session registry replaces it, omp #14196/#14199), an unresponsive kernel is graded up to termination — not isolation.
 
 ## Mounting
 

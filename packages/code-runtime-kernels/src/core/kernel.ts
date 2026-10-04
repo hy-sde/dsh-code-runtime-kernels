@@ -278,6 +278,8 @@ export class KernelHost {
   #disposed = false
   #interruptEscalationMs: number
   #shutdownGraceMs: number
+  /** Last stdin failure cause (omp #14196/#14199), surfaced in the next write's rejection. */
+  #stdinFailure: string | undefined
 
   /**
    * Spawn a kernel per the profile and wait for the bootstrap handshake.
@@ -371,6 +373,14 @@ export class KernelHost {
     proc.stderr?.setEncoding('utf8')
     proc.stdout?.on('data', (chunk: string) => { this.#ingest(chunk) })
     proc.stderr?.on('data', (chunk: string) => { this.#ingestStray(chunk) })
+    // A failed write to a dead kernel's stdin surfaces twice: through the
+    // write callback (the failing call owns that rejection) and as an 'error'
+    // event on the stream itself. Without a listener, Node escalates that
+    // event to an uncaught `Error: write EPIPE` that kills the whole host —
+    // the fork form of omp's #14196/#14199 pipe-failure crash. Record the
+    // cause for the next write's rejection; the kernel's retirement stays
+    // with the write path that observed the failure.
+    proc.stdin?.on('error', (error: Error) => { this.#stdinFailure ??= messageOf(error) })
     this.#exited = new Promise<number>((resolve) => { proc.once('exit', (code) => { resolve(code ?? 0) }) })
     void this.#exited.then((code) => { this.#onProcessExit(code) })
     this.#ready = new Promise<void>((resolve) => { this.#settleReady = resolve })
@@ -386,7 +396,9 @@ export class KernelHost {
    * across calls, and only ONE exec may be in flight per kernel at a time —
    * the session registry serializes; callers must not overlap. Must be called
    * while {@link isAlive}. Resolves with a {@link KernelExecResult} whose
-   * flags the provider maps onto the failure kinds.
+   * flags the provider maps onto the failure kinds; a failed stdin write
+   * resolves killed instead of rejecting, and retires the kernel
+   * (omp #14196/#14199).
    */
   async execute(
     id: string,
@@ -420,6 +432,7 @@ export class KernelHost {
     if (options.signal?.aborted) onAbort()
     else options.signal?.addEventListener('abort', onAbort, { once: true })
 
+    let transportFailed = false
     try {
       const frame = {
         type: 'exec' as const,
@@ -434,11 +447,31 @@ export class KernelHost {
         ...options.env !== undefined ? { env: options.env } : {},
         ...options.snapshot !== undefined ? { snapshot: options.snapshot } : {},
       }
-      await this.#write(frame)
+      try {
+        await this.#write(frame)
+      } catch (error: unknown) {
+        // A failing stdin write is terminal (omp #14196/#14199): the frame
+        // may have partially reached a now-dead runner, so completion is
+        // uncertain — settle the run as killed instead of leaving the caller
+        // hanging on a promise nothing will ever resolve. `killed` drives the
+        // session registry's replace-and-retry recovery.
+        transportFailed = true
+        if (this.#alive) {
+          run.status = 'error'
+          run.cancelled = true
+          run.killed = true
+          run.message = `${this.profile.label} stdin write failed: ${messageOf(error)}`
+          run.finalize()
+        }
+        // Already settled (the exit handler won the race): keep its message.
+      }
       await run.done
     } finally {
       options.signal?.removeEventListener('abort', onAbort)
       this.#runs.delete(id)
+      // Retire only after the run has left the map, so the shutdown sweep
+      // cannot overwrite the settled message (omp 24900b993c).
+      if (transportFailed) void this.shutdown()
     }
     return {
       ...this.#collect(run),
@@ -645,7 +678,7 @@ export class KernelHost {
   #dispatchCall(frame: Extract<KernelFrame, { type: 'call' }>): void {
     const run = this.#runs.get(frame.id)
     if (run === undefined) {
-      void this.#writeReply(frame.id, frame.seq, {
+      this.#sendReply(frame.id, frame.seq, {
         ok: false,
         message: `no active run for id ${frame.id}`,
         name: frame.name,
@@ -659,7 +692,7 @@ export class KernelHost {
     const record = run.namespaces.get(frame.global)?.functions
     const fn = record !== undefined && Object.hasOwn(record, frame.name) ? record[frame.name] : undefined
     if (typeof fn !== 'function') {
-      void this.#writeReply(frame.id, frame.seq, {
+      this.#sendReply(frame.id, frame.seq, {
         ok: false,
         message: `unknown binding ${JSON.stringify(`${frame.global}.${frame.name}`)}`,
         name: frame.name,
@@ -676,22 +709,38 @@ export class KernelHost {
           value = undefined
         }
         if (value === undefined) {
-          await this.#writeReply(frame.id, frame.seq, {
+          this.#sendReply(frame.id, frame.seq, {
             ok: false,
             message: 'binding resolution must be lossless JSON',
             name: frame.name,
           })
           return
         }
-        await this.#writeReply(frame.id, frame.seq, { ok: true, value, name: frame.name })
+        this.#sendReply(frame.id, frame.seq, { ok: true, value, name: frame.name })
       } catch (error: unknown) {
-        await this.#writeReply(frame.id, frame.seq, {
+        this.#sendReply(frame.id, frame.seq, {
           ok: false,
           message: messageOf(error),
           name: frame.name,
         })
       }
     })()
+  }
+
+  /**
+   * Fire-and-forget reply write. A reply races the kernel's death: when the
+   * pipe is already gone the write fails, and the reply is merely unsent —
+   * never a host-level failure. Letting that rejection escape (nobody awaits
+   * these writes) would crash the host as an unhandled rejection — the reply
+   * half of omp #14196/#14199. The run settles through its own exec path;
+   * the kernel is retired there.
+   */
+  #sendReply(
+    id: string,
+    seq: number,
+    payload: { ok: true; value: PtcJsonValue; name: string } | { ok: false; message: string; name: string },
+  ): void {
+    void this.#writeReply(id, seq, payload).catch((error: unknown) => { this.#stdinFailure ??= messageOf(error) })
   }
 
   #writeReply(
@@ -709,7 +758,7 @@ export class KernelHost {
   #write(message: KernelHostMessage): Promise<void> {
     const next = this.#writeChain.then(() => new Promise<void>((resolve, reject) => {
       if (this.#proc.stdin === null || this.#proc.stdin.destroyed) {
-        reject(new Error(`${this.profile.prefix}: kernel stdin closed`))
+        reject(new Error(`${this.profile.prefix}: kernel stdin closed${this.#stdinFailure !== undefined ? ` (${this.#stdinFailure})` : ''}`))
         return
       }
       this.#proc.stdin.write(`${JSON.stringify(message)}\n`, (error?: Error | null) => {

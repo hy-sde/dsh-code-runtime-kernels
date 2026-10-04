@@ -9,9 +9,9 @@
 - **Python** —— 一个长寿命 `python3` 子进程，运行[自包含内核](./src/python/runner.ts)（仅标准库，无需 venv/pip）。模块级变量与一个 asyncio 事件循环跨 cell 保留；支持顶层 `await`；最后一个表达式即 cell 的值。
 - **JavaScript** —— 一个长寿命 `node` 子进程，运行[自包含内核](./src/nodejs/runner.ts)（仅 Node 内置）。持久 `state` 对象与进程全局对象携带跨 cell 的值；每个 cell 以 async 函数体运行，支持顶层 `await`/`return`；`return <json>` 携带完成值。
 
-线上协议、kernel host 驱动（spawn + 握手、串行写入、敌对对端解析、SIGINT→SIGTERM→SIGKILL 升级、退出握手）、会话注册表、绑定校验与输出账本全部共享（`src/core/`），两个语言的语义完全一致。
+线上协议、kernel host 驱动（spawn + 握手、串行写入、敌对对端解析、SIGINT→SIGTERM→SIGKILL 升级、stdin 管道失败结算、退出握手）、会话注册表、绑定校验与输出账本全部共享（`src/core/`），两个语言的语义完全一致。
 
-这是**进程隔离，而非安全边界**：程序源码拥有与内置 `process` 隔离后端相同的 bash 级信任。驱动的职责是健壮性——伪造帧不会弄崩 host，无响应的 kernel 会被逐步升级到终止——而非隔离。
+这是**进程隔离，而非安全边界**：程序源码拥有与内置 `process` 隔离后端相同的 bash 级信任。驱动的职责是健壮性——伪造帧不会弄崩 host，向已死亡 kernel 的 stdin 写入失败会将进行中的运行结算为 killed 并退役该 kernel（会话注册表随之替换它，omp #14196/#14199），无响应的 kernel 会被逐步升级到终止——而非隔离。
 
 ## 挂载
 
