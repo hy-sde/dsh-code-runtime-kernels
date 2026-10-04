@@ -4,7 +4,7 @@
 > npm: [`@hy-sde-org/dsh-code-runtime-kernels`](https://www.npmjs.com/package/@hy-sde-org/dsh-code-runtime-kernels)
 <!-- MIRROR-NOTE:END -->
 
-# dsh-code-runtime-kernels
+# dsh-code-runtime-kernels — persistent code-execution kernels for DeepSeek Harness
 
 **Persistent Python + JavaScript kernels for DeepSeek Harness** — a standalone
 plugin repo hosting ONE package,
@@ -12,6 +12,27 @@ plugin repo hosting ONE package,
 gives the model a first-class `run_kernel_code` tool with `session`/`reset`
 state, execution counts, and both languages — with **zero upstream harness
 changes** required.
+
+| Identity | Value |
+| --- | --- |
+| Package | `@hy-sde-org/dsh-code-runtime-kernels` |
+| Plugin id | `hy-sde-kernels` — one self-contained row (the `hy-sde-` prefix avoids clashing with shipped row ids) |
+| Seam | the `run_kernel_code` tool, registered on the host's `tools` service exactly like any shipped tool row |
+
+> **Based on [oh-my-pi](https://github.com/can1357/oh-my-pi)** — the Python and
+> JavaScript kernel runners and the kernel-session registry are adapted from
+> oh-my-pi's code-execution implementation; the snapshot/restore design is
+> informed by the MIT-licensed [pi-repl-py](https://github.com/k3-2o/pi-repl-py),
+> reimplemented self-contained. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
+
+## Why
+
+Computation with intermediate results should not re-pay its setup on every
+call. These kernels give the model session state that persists across calls —
+and, via namespace snapshots, survives kernel death, idle reaping, and full
+plugin restarts — while one shared host driver (`src/core/`) makes both
+languages behave identically. It is process confinement, not a security
+boundary, matching the harness's own `process` backends.
 
 ```
 packages/code-runtime-kernels/
@@ -30,7 +51,8 @@ packages/code-runtime-kernels/
   cordis.patch.yml  the bundle row deployments mount
 ```
 
-Design decisions:
+## Design decisions
+
 - **One plugin, two providers, one core.** Both kernels share the driver in
   `src/core/`; each language contributes only its runner and a
   `KernelRuntimeProfile`. Adding a language means a runner + a profile, not a
@@ -68,7 +90,84 @@ Design decisions:
 - **Process confinement, not a security boundary**, matching the harness's own
   `process` backends.
 
+## Prerequisites
+
+- Node.js `^22.19.0 || >=24.0.0` (the package `engines` range) with npm and
+  pnpm on `PATH`;
+- `python3` and `node` interpreters — the runner spawns them (`pythonPath` /
+  `nodePath`, PATH discovery by default) and fails loud at the first spawn
+  when one is absent;
+- DeepSeek Harness `0.1.2-rc.1` or newer, including the standard `dsh` CLI —
+  the plugin mounts as an ordinary Cordis row, no upstream harness changes;
+- optional: an interpreter with IPython installed for `pythonImpl:
+  'ipykernel'`, and the `@deepseek-ai/dsh-sandbox` `confine` capability when
+  `sandboxConfinement: true`.
+
+Install the Harness CLI and pnpm before continuing:
+
+```bash
+npm install --global @deepseek-ai/dsh@0.1.2-rc.1 pnpm
+dsh --version
+```
+
 ## Quick start
+
+### Route A — published npm package (recommended)
+
+```bash
+dsh plugin --profile web add @hy-sde-org/dsh-code-runtime-kernels
+```
+
+A bundle row ships (`cordis.patch.yml` inserts the `hy-sde-kernels` row), so
+this single command mounts the plugin and the model gets `run_kernel_code`.
+
+### Route B — from source (validate this checkout or hack on the plugin)
+
+```bash
+git clone git@github.com:hy-sde/dsh-plugins.git
+cd dsh-plugins
+pnpm install
+pnpm --filter @hy-sde-org/dsh-code-runtime-kernels build
+
+KERNELS_TGZ="$(cd dsh-code-runtime-kernels/packages/code-runtime-kernels && pnpm pack --silent --pack-destination /tmp)"
+dsh plugin --profile web add "$KERNELS_TGZ"
+```
+
+`pnpm pack` runs the normal `prepack` build and produces a tarball containing
+`dist/`. Full docs in the
+[package README](./packages/code-runtime-kernels/README.md).
+
+### Verify the composed configuration
+
+```bash
+dsh web --dump-config
+```
+
+The composed tree must show the `hy-sde-kernels` row loading
+`@hy-sde-org/dsh-code-runtime-kernels`.
+
+### Run
+
+```bash
+dsh web
+```
+
+Ask the model to run code with `run_kernel_code`: related calls sharing one
+`session` id keep kernel state (variables, imports, working data), `reset:
+true` discards a session's state, and a session reaped or killed resumes from
+its snapshot on the next call with the same id.
+
+### Uninstall
+
+```bash
+dsh plugin --profile web remove @hy-sde-org/dsh-code-runtime-kernels
+```
+
+Uninstalling removes the tool row; persisted snapshots under the configured
+`snapshotDir` (default `~/.dsh/code-runtime-kernels/state`) stay on disk —
+delete them separately if you want the state gone.
+
+## Development
 
 ```bash
 pnpm install
@@ -77,10 +176,6 @@ pnpm test      # vitest — real python3/node subprocesses
 pnpm build     # tsc → dist
 bash scripts/release-public.sh --check
 ```
-
-Mount the bundle (`@hy-sde-org/dsh-code-runtime-kernels` row from
-`cordis.patch.yml`) into any deployment, and the model gets `run_kernel_code`.
-Full docs in the [package README](./packages/code-runtime-kernels/README.md).
 
 ## License
 
