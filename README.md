@@ -97,7 +97,7 @@ packages/code-runtime-kernels/
 - `python3` and `node` interpreters — the runner spawns them (`pythonPath` /
   `nodePath`, PATH discovery by default) and fails loud at the first spawn
   when one is absent;
-- DeepSeek Harness `0.1.2-rc.1` or newer, including the standard `dsh` CLI —
+- DeepSeek Harness `0.2.0-rc.2` or newer, including the standard `dsh` CLI —
   the plugin mounts as an ordinary Cordis row, no upstream harness changes;
 - optional: an interpreter with IPython installed for `pythonImpl:
   'ipykernel'`, and the `@deepseek-ai/dsh-sandbox` `confine` capability when
@@ -106,7 +106,7 @@ packages/code-runtime-kernels/
 Install the Harness CLI and pnpm before continuing:
 
 ```bash
-npm install --global @deepseek-ai/dsh@0.1.2-rc.1 pnpm
+npm install --global @deepseek-ai/dsh@0.2.0-rc.2 pnpm
 dsh --version
 ```
 
@@ -129,7 +129,7 @@ cd dsh-plugins
 pnpm install
 pnpm --filter @hy-sde-org/dsh-code-runtime-kernels build
 
-KERNELS_TGZ="$(cd dsh-code-runtime-kernels/packages/code-runtime-kernels && pnpm pack --silent --pack-destination /tmp)"
+KERNELS_TGZ="$(cd dsh-code-runtime-kernels/packages/code-runtime-kernels && pnpm pack --pack-destination /tmp | tail -n 1)"
 dsh plugin --profile web add "$KERNELS_TGZ"
 ```
 
