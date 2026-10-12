@@ -79,15 +79,17 @@ export class LineSplitter {
 
   #drain(): string {
     const line = this.#decoder.decode(this.#buffer.subarray(0, this.#length))
+    const drained = this.#length
     this.#length = 0
-    this.#releaseCapacity()
+    this.#releaseCapacity(drained)
     return line
   }
 
-  #releaseCapacity(): void {
+  #releaseCapacity(drained: number): void {
     if (this.#buffer.length <= RETAIN_BYTES) return
-    // Still ≥25% full: a stream of oversized frames would re-grow per line.
-    if (this.#length * 4 > this.#buffer.length) return
+    // The just-drained line still filled ≥25% of the buffer: a stream of
+    // oversized frames would re-grow per line.
+    if (drained * 4 > this.#buffer.length) return
     this.#buffer = Buffer.allocUnsafe(0)
   }
 }
