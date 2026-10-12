@@ -414,15 +414,64 @@ async function runCell(code: string, run: ActiveRun, namespaces: ExecNamespaceDe
 
 // --- wire loop ---------------------------------------------------------------
 
-let readBuffer = ''
-process.stdin.setEncoding('utf8')
-process.stdin.on('data', (chunk: string) => {
-  readBuffer += chunk
-  for (;;) {
-    const nl = readBuffer.indexOf('\n')
-    if (nl < 0) break
-    const line = readBuffer.slice(0, nl)
-    readBuffer = readBuffer.slice(nl + 1)
+/* jscpd:ignore-start — the runner must stay self-contained (no imports of
+   other package sources), so this mirrors src/core/lines.ts in reduced,
+   push-only form: scan each chunk for 0x0A, buffer only the trailing suffix,
+   and decode per complete line (a UTF-8 sequence never contains a line
+   break, so per-line decode is multibyte-safe across chunk boundaries). No
+   trailing-line flush at stdin end, mirroring upstream's runner-side
+   readers: the host only closes the pipe at shutdown. */
+const FRAME_LF = 0x0a
+
+class FrameLineSplitter {
+  #buffer = Buffer.allocUnsafe(0)
+  #length = 0
+  #decoder = new TextDecoder()
+
+  push(chunk: Buffer): string[] {
+    const lines: string[] = []
+    let position = 0
+    while (position < chunk.length) {
+      const nl = chunk.indexOf(FRAME_LF, position)
+      if (nl === -1) {
+        this.#append(chunk.subarray(position))
+        return lines
+      }
+      const suffix = chunk.subarray(position, nl)
+      position = nl + 1
+      if (this.#length === 0) {
+        lines.push(this.#decoder.decode(suffix))
+      } else {
+        this.#append(suffix)
+        lines.push(this.#drain())
+      }
+    }
+    return lines
+  }
+
+  #append(bytes: Uint8Array): void {
+    const size = bytes.length
+    if (size === 0) return
+    if (this.#length + size > this.#buffer.length) {
+      const next = Buffer.allocUnsafe(Math.max(this.#length + size, this.#buffer.length * 2))
+      this.#buffer.copy(next, 0, 0, this.#length)
+      this.#buffer = next
+    }
+    this.#buffer.set(bytes, this.#length)
+    this.#length += size
+  }
+
+  #drain(): string {
+    const line = this.#decoder.decode(this.#buffer.subarray(0, this.#length))
+    this.#length = 0
+    return line
+  }
+}
+/* jscpd:ignore-end */
+
+const frameSplitter = new FrameLineSplitter()
+process.stdin.on('data', (chunk: Buffer) => {
+  for (const line of frameSplitter.push(chunk)) {
     if (!line.trim()) continue
     let message: unknown
     try {
