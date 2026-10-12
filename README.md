@@ -41,7 +41,7 @@ packages/code-runtime-kernels/
                     (spawn+handshake, hostile-peer parsing, interrupt
                     escalation, shutdown), `SessionRegistry` (serialize,
                     reset, replace-and-retry), output ledger, binding
-                    validation, invariant
+                    validation.
     python/runner.ts   embedded self-contained Python kernel (stdlib only)
     nodejs/runner.ts   compiled self-contained Node.js kernel (builtins only)
     index.ts            plugin: config, KernelManager, run_kernel_code tool
