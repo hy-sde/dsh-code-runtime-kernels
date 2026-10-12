@@ -67,6 +67,21 @@ except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
 
 _OUT_LOCK = threading.Lock()
 
+# Requests likewise arrive on a private dup of the original stdin, and fd 0
+# itself is repointed at os.devnull: user code, and every process it spawns
+# without an explicit stdin, then reads immediate EOF instead of blocking on
+# (or stealing frames from) a control channel that stays open for the
+# kernel's whole life. The host still writes NDJSON requests to the
+# subprocess stdin.
+try:
+    _CONTROL_FD = os.dup(sys.__stdin__.fileno())
+    _CONTROL_IN = os.fdopen(_CONTROL_FD, "r", encoding="utf-8")
+    _devnull_fd = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(_devnull_fd, sys.__stdin__.fileno())
+    os.close(_devnull_fd)
+except (AttributeError, OSError, ValueError, io.UnsupportedOperation):
+    _CONTROL_IN = sys.__stdin__
+
 
 def _json_default(value: Any) -> Any:
     try:
@@ -925,7 +940,7 @@ async def _main_async() -> None:
     _maybe_init_ipython()
     _start_capture_drain()
 
-    stdin = sys.__stdin__
+    stdin = _CONTROL_IN
     if stdin is None:
         return
     loop = asyncio.get_running_loop()
