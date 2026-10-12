@@ -12,13 +12,13 @@
 
 import { spawn } from 'node:child_process'
 import type { ChildProcess } from 'node:child_process'
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { PtcBindingNamespace, PtcJsonValue } from '@deepseek-ai/dsh-ptc-runtime'
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import type { DoneFrame, KernelFrame, KernelHostMessage, SnapshotSpec } from './protocol.ts'
+import { resolveRunnerStagingDir } from './staging.ts'
 export type { DoneFrame, KernelFrame, KernelHostMessage, SnapshotSpec }
 
 /** How to spawn and label one language's kernel. */
@@ -135,8 +135,8 @@ export function nodejsKernelProfile(command: string): KernelRuntimeProfile {
   }
 }
 
-/** Shared scratch root for staged runner scripts (inside the OS temp dir). */
-const runnerDir = join(tmpdir(), 'dsh-kernels')
+/** Base name of the runner staging directory under the OS temp dir (the resolver adds the per-uid suffix). */
+const RUNNER_DIR_NAME = 'dsh-kernels'
 
 /** Render an unknown thrown value as a string, Error or not. */
 function messageOf(error: unknown): string {
@@ -291,12 +291,12 @@ export class KernelHost {
 
     // A runner may be a shipped file, or embedded source staged to a scratch
     // file per spawn (tempdirs are shared host state; the embedded code may
-    // change between versions). Only the staged variant touches the disk.
+    // change between versions). Only the staged variant touches the disk, in
+    // an owner-private per-uid dir re-validated on every spawn.
     let stagedPath: string | undefined
     if (profile.stagedSource !== undefined) {
-      mkdirSync(runnerDir, { recursive: true })
       stagedPath = join(
-        runnerDir,
+        resolveRunnerStagingDir(RUNNER_DIR_NAME),
         `runner-${process.pid}-${Math.random().toString(36).slice(2, 10)}${profile.stagedSuffix ?? ''}`,
       )
       try {
