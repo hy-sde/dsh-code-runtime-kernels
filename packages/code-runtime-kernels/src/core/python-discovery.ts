@@ -15,20 +15,25 @@ import { delimiter, join } from 'node:path'
  * Empty entries are skipped, matches are deduplicated, and a match must be a
  * regular file with the execute bit (a directory or a non-executable file is
  * not a candidate). There is no PATHEXT or platform-toolchain fallback: the
- * PATH scan is the whole contract.
+ * PATH scan is the whole contract. On win32 each entry is tried as
+ * `command.exe` before the literal name, matching CreateProcessW's
+ * exe-first resolution.
  */
-export function whichAll(command: string, env: { PATH?: string } = process.env): string[] {
+export function whichAll(command: string, env: { PATH?: string } = process.env, platform: NodeJS.Platform = process.platform): string[] {
+  const names = platform === 'win32' ? [`${command}.exe`, command] : [command]
   const matches: string[] = []
   for (const dir of (env.PATH ?? '').split(delimiter)) {
     if (dir === '') continue
-    const candidate = join(dir, command)
-    try {
-      if (!statSync(candidate).isFile()) continue
-      accessSync(candidate, constants.X_OK)
-    } catch {
-      continue
+    for (const name of names) {
+      const candidate = join(dir, name)
+      try {
+        if (!statSync(candidate).isFile()) continue
+        accessSync(candidate, constants.X_OK)
+      } catch {
+        continue
+      }
+      if (!matches.includes(candidate)) matches.push(candidate)
     }
-    if (!matches.includes(candidate)) matches.push(candidate)
   }
   return matches
 }
@@ -37,13 +42,14 @@ export function whichAll(command: string, env: { PATH?: string } = process.env):
  * Ordered python candidates for one resolution: an explicitly configured
  * interpreter first, then every `python` and every `python3` on PATH (each
  * list in PATH order; a `python` match is tried before a `python3` match at
- * the same precedence).
+ * the same precedence; on win32, `.exe` matches come before bare names per
+ * PATH entry).
  */
-export function enumeratePythonCandidates(configured: string | undefined, env: { PATH?: string } = process.env): string[] {
+export function enumeratePythonCandidates(configured: string | undefined, env: { PATH?: string } = process.env, platform: NodeJS.Platform = process.platform): string[] {
   return [
     ...configured !== undefined ? [configured] : [],
-    ...whichAll('python', env),
-    ...whichAll('python3', env),
+    ...whichAll('python', env, platform),
+    ...whichAll('python3', env, platform),
   ]
 }
 
@@ -85,8 +91,8 @@ export async function probePythonInterpreter(command: string, timeoutMs: number)
       resolve(`timed out after ${timeoutMs}ms`)
     }, timeoutMs)
     timer.unref()
-    child.stdout?.on('data', (chunk: Buffer) => { stdout += chunk })
-    child.stderr?.on('data', (chunk: Buffer) => { stderr += chunk })
+    child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString('utf8') })
+    child.stderr.on('data', (chunk: Buffer) => { stderr += chunk.toString('utf8') })
     child.on('error', (error: Error) => {
       if (timedOut) return
       clearTimeout(timer)
@@ -95,10 +101,6 @@ export async function probePythonInterpreter(command: string, timeoutMs: number)
     child.on('close', (code: number | null, signal: string | null) => {
       if (timedOut) return
       clearTimeout(timer)
-      if (timedOut) {
-        resolve(`timed out after ${timeoutMs}ms`)
-        return
-      }
       if (code === 0 && VERSION_REPORT.test(stdout.trim())) {
         resolve(undefined)
         return

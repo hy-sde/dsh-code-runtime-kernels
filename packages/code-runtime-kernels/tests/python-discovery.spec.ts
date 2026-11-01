@@ -86,6 +86,19 @@ describe('whichAll', () => {
     const shim = writeShim(dir, 'python', 'exit 0')
     expect(whichAll('python', { PATH: `${delimiter}${dir}${delimiter}${dir}` })).toEqual([shim])
   })
+
+  it('on win32 matches the .exe interpreter before the literal name in each entry', () => {
+    const dir = makeFixtureDir()
+    const exe = writeShim(dir, 'python.exe', 'exit 0')
+    const bare = writeShim(dir, 'python', 'exit 0')
+    expect(whichAll('python', { PATH: dir }, 'win32')).toEqual([exe, bare])
+  })
+
+  it('on posix ignores .exe-named files', () => {
+    const dir = makeFixtureDir()
+    writeShim(dir, 'python.exe', 'exit 0')
+    expect(whichAll('python', { PATH: dir }, 'darwin')).toEqual([])
+  })
 })
 
 describe('probePythonInterpreter', () => {
@@ -128,6 +141,13 @@ describe('enumeratePythonCandidates', () => {
     expect(enumeratePythonCandidates(configured, { PATH: `${second}${delimiter}${first}` }))
       .toEqual([configured, pyInSecond, py3InSecond, py3InFirst])
   })
+
+  it('on win32 enumerates .exe interpreters after the configured path', () => {
+    const dir = makeFixtureDir()
+    const py3 = writeShim(dir, 'python3.exe', 'exit 0')
+    const configured = 'C:\\py\\python.exe'
+    expect(enumeratePythonCandidates(configured, { PATH: dir }, 'win32')).toEqual([configured, py3])
+  })
 })
 
 describe('resolvePythonCommand', () => {
@@ -148,12 +168,15 @@ describe('resolvePythonCommand', () => {
     const dir = makeFixtureDir()
     const failing = writeShim(dir, 'failing-python', 'echo "mise: no version is set" >&2\nexit 1')
     const hanging = writeShim(dir, 'hanging-python', 'exec sleep 30')
-    const error = await resolvePythonCommand([failing, hanging], { probeTimeoutMs: 300 })
+    // 1s, not a bare 300ms: under a parallel suite the failing shim's spawn+exit
+    // can itself exceed a tighter budget and get reported as a timeout, flipping
+    // the expected reason.
+    const error = await resolvePythonCommand([failing, hanging], { probeTimeoutMs: 1_000 })
       .then(() => undefined, (error: unknown) => error)
     expect(error).toBeInstanceOf(Error)
     expect((error as Error).message).toBe(
       'dsh-code-runtime-kernels: no working python interpreter found '
-      + `(${failing}: exited with code 1: mise: no version is set; ${hanging}: timed out after 300ms); `
+      + `(${failing}: exited with code 1: mise: no version is set; ${hanging}: timed out after 1000ms); `
       + 'install a working python3 on PATH or set config.pythonPath',
     )
   })
