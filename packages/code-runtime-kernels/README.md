@@ -6,7 +6,7 @@ English | [中文](README.zh.md)
 
 Two long-lived kernel subprocesses share one host driver:
 
-- **Python** — a long-lived `python3` subprocess running a [self-contained kernel](./src/python/runner.ts) (standard library only — no venv, no pip). Module-level variables and one asyncio event loop persist across cells; top-level `await` works; the last expression is the cell's value.
+- **Python** — a long-lived Python subprocess running a [self-contained kernel](./src/python/runner.ts) (standard library only — no venv, no pip), booted from the first healthy interpreter candidate: `config.pythonPath` probed first, then every `python`/`python3` on PATH. Module-level variables and one asyncio event loop persist across cells; top-level `await` works; the last expression is the cell's value.
 - **JavaScript** — a long-lived `node` subprocess running a [self-contained kernel](./src/nodejs/runner.ts) (Node builtins only). A persistent `state` object plus the process-global object carry values across cells; every cell runs as an async function body, so top-level `await` and `return` work; `return <json>` carries the completion value.
 
 The wire protocol, kernel host driver (spawn + handshake, serialized writes, hostile-peer parsing, SIGINT with SIGTERM/SIGKILL escalation, stdin pipe-failure settlement, shutdown-to-exit), session registry, binding validation, and output ledger are shared (`src/core/`), so both languages behave identically.
@@ -41,7 +41,8 @@ All row ids carry the `hy-sde-` prefix so they never clash with shipped rows (a 
 | Key | Default | Meaning |
 |---|---|---|
 | `languages` | `['python', 'typescript']` | Enabled languages; a call to a disabled language is refused at call time. |
-| `pythonPath` | `python3` | Explicit python executable (PATH discovery by default; fails loud at first spawn when absent). |
+| `pythonPath` | PATH discovery | Explicit python interpreter, probed first; then every `python`/`python3` on PATH in PATH order (first healthy candidate wins; fails loud with per-candidate reasons when none works). |
+| `pythonProbeTimeoutMs` | `5000` | Per-candidate probe budget (a `-c` version check) while resolving the python interpreter. |
 | `nodePath` | `node` | Explicit node executable (PATH discovery by default). |
 | `toolTimeoutMs` | `30000` | Cooperative tool-call timeout (`exec.signal` becomes the per-run abort). |
 | `maxWallMs` | `600000` | Per-run wall-clock budget; interrupt gradates SIGINT → SIGTERM → SIGKILL when the kernel does not respond. |

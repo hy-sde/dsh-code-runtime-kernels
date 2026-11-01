@@ -6,7 +6,7 @@
 
 两个长期存活的 kernel 子进程共享同一个 host 驱动：
 
-- **Python** —— 一个长寿命 `python3` 子进程，运行[自包含内核](./src/python/runner.ts)（仅标准库，无需 venv/pip）。模块级变量与一个 asyncio 事件循环跨 cell 保留；支持顶层 `await`；最后一个表达式即 cell 的值。
+- **Python** —— 一个长寿命 Python 子进程，运行[自包含内核](./src/python/runner.ts)（仅标准库，无需 venv/pip），从第一个健康的解释器候选启动：先探测 `config.pythonPath`，再探测 PATH 上的每个 `python`/`python3`。模块级变量与一个 asyncio 事件循环跨 cell 保留；支持顶层 `await`；最后一个表达式即 cell 的值。
 - **JavaScript** —— 一个长寿命 `node` 子进程，运行[自包含内核](./src/nodejs/runner.ts)（仅 Node 内置）。持久 `state` 对象与进程全局对象携带跨 cell 的值；每个 cell 以 async 函数体运行，支持顶层 `await`/`return`；`return <json>` 携带完成值。
 
 线上协议、kernel host 驱动（spawn + 握手、串行写入、敌对对端解析、SIGINT→SIGTERM→SIGKILL 升级、stdin 管道失败结算、退出握手）、会话注册表、绑定校验与输出账本全部共享（`src/core/`），两个语言的语义完全一致。
@@ -39,7 +39,8 @@
 | 键 | 默认 | 含义 |
 |---|---|---|
 | `languages` | `['python', 'typescript']` | 启用的语言；调用未启用语言会被拒绝。 |
-| `pythonPath` | `python3` | 显式 python 可执行文件（默认走 PATH 发现；缺失时首次 spawn 即失败）。 |
+| `pythonPath` | PATH 发现 | 显式 python 解释器，最先探测；然后按 PATH 顺序探测每个 `python`/`python3`（第一个健康候选胜出；全部失败时携带逐候选原因失败）。 |
+| `pythonProbeTimeoutMs` | `5000` | 解析 python 解释器时每个候选的探测预算（一次 `-c` 版本检查）。 |
 | `nodePath` | `node` | 显式 node 可执行文件（默认走 PATH 发现）。 |
 | `toolTimeoutMs` | `30000` | 协作式工具调用超时（`exec.signal` 变为每次运行的 abort 源）。 |
 | `maxWallMs` | `600000` | 每次运行的墙钟预算；中断按 SIGINT→SIGTERM→SIGKILL 升级。 |

@@ -36,6 +36,7 @@ import { MAX_TIMER_DELAY_MS } from '@deepseek-ai/dsh-timeout'
 import { KernelHost, nodejsKernelProfile } from './core/kernel.ts'
 import type { KernelExecResult, KernelSandboxProvider } from './core/kernel.ts'
 import type { SnapshotSpec } from './core/protocol.ts'
+import { enumeratePythonCandidates, resolvePythonCommand } from './core/python-discovery.ts'
 import { SessionRegistry } from './core/session.ts'
 import { PYTHON_RUNNER } from './python/runner.ts'
 
@@ -52,8 +53,14 @@ export const inject = ['tools', 'systemPrompt']
 export interface Config {
   /** Enabled languages; kernels of disabled languages are refused at call time. */
   languages?: ('python' | 'typescript')[]
-  /** Explicit python executable. Defaults to `python3` on PATH (fails loud at first spawn when absent). */
+  /**
+   * Explicit python interpreter, probed first; then every `python`/`python3`
+   * on PATH (first healthy candidate wins; fails loud with per-candidate
+   * reasons when none works).
+   */
   pythonPath?: string
+  /** Probe budget per candidate while resolving the python interpreter (ms; default 5000). */
+  pythonProbeTimeoutMs?: number
   /**
    * Python execution semantics: `stdlib` (default, self-contained runner) or
    * `ipykernel` (real IPython shell: magics, `!cmd`, display — the interpreter
@@ -121,6 +128,7 @@ type ResolvedConfig = Required<Omit<Config, 'pythonPath' | 'nodePath' | 'sandbox
 export const Config: z<Config> = z.object({
   languages: z.array(z.union(['python', 'typescript'] as const)).default(['python', 'typescript']),
   pythonPath: z.string(),
+  pythonProbeTimeoutMs: z.number().default(5_000),
   pythonImpl: z.union(['stdlib', 'ipykernel'] as const).default('stdlib'),
   nodePath: z.string(),
   toolTimeoutMs: z.number().default(30_000),
@@ -279,6 +287,8 @@ export class KernelManager {
   readonly #registries = new Map<'python' | 'typescript', SessionRegistry>()
   readonly #ledgerFactory: () => OutputLedger
   readonly #confine: ((argv: readonly string[]) => { argv: string[] }) | undefined
+  /** Python commands whose probe already passed this manager's lifetime; failures are never cached. */
+  readonly #verifiedPython = new Set<string>()
   #disposed = false
 
   constructor(config: Config) {
@@ -288,6 +298,7 @@ export class KernelManager {
     const resolved: ResolvedConfig = {
       languages: config.languages ?? ['python', 'typescript'],
       ...config.pythonPath !== undefined ? { pythonPath: config.pythonPath } : {},
+      pythonProbeTimeoutMs: config.pythonProbeTimeoutMs ?? 5_000,
       pythonImpl: config.pythonImpl ?? 'stdlib',
       ...config.nodePath !== undefined ? { nodePath: config.nodePath } : {},
       toolTimeoutMs: config.toolTimeoutMs ?? 30_000,
@@ -309,7 +320,7 @@ export class KernelManager {
       sandboxMode: config.sandboxMode ?? 'workspace-write',
     }
     const numericKeys = ['maxWallMs', 'maxOutputBytes', 'maxOutputLineChars', 'sessionIdleMs',
-      'interruptEscalationMs', 'startupTimeoutMs', 'shutdownGraceMs',
+      'interruptEscalationMs', 'startupTimeoutMs', 'shutdownGraceMs', 'pythonProbeTimeoutMs',
       'snapshotMaxBytes', 'snapshotMaxEntryBytes'] as const
     for (const key of numericKeys) {
       const value = resolved[key]
@@ -457,10 +468,11 @@ export class KernelManager {
       : this.#startNodejs()
   }
 
-  #startPython(): Promise<KernelHost> {
+  async #startPython(): Promise<KernelHost> {
+    const command = await this.#resolvePythonCommand()
     const profile = {
       key: 'python' as const,
-      command: this.#config.pythonPath ?? 'python3',
+      command,
       argvPrefix: ['-u'],
       stagedSource: PYTHON_RUNNER,
       stagedSuffix: '.py',
@@ -476,6 +488,14 @@ export class KernelManager {
       label: 'python kernel',
     }
     return KernelHost.start(profile, this.#startConfig())
+  }
+
+  /** Resolve the python command for a kernel start (config.pythonPath first, then PATH candidates). */
+  #resolvePythonCommand(): Promise<string> {
+    return resolvePythonCommand(enumeratePythonCandidates(this.#config.pythonPath), {
+      probeTimeoutMs: this.#config.pythonProbeTimeoutMs,
+      verified: this.#verifiedPython,
+    })
   }
 
   #startNodejs(): Promise<KernelHost> {
