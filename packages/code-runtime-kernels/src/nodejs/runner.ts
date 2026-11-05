@@ -47,11 +47,13 @@ interface ReplyMessage {
   message?: string
   name?: string
 }
+import { createRequire, stripTypeScriptTypes } from 'node:module'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname } from 'node:path'
+import { dirname, join } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { format } from 'node:util'
 import { deserialize, serialize } from 'node:v8'
-import { compileFunction } from 'node:vm'
+import { compileFunction, type CompileFunctionOptions } from 'node:vm'
 
 /** Global-object accessor for program-scope globals keyed by identifier. */
 const g: Record<string, unknown> = globalThis
@@ -84,8 +86,22 @@ let executionCount = 0
 let snapshotSpec: SnapshotSpec | null = null
 /** Restore happens once per process, on the first exec carrying a spec. */
 let snapshotRestored = false
-/** How the last run settled: only a successful run writes a snapshot. */
-let lastRunSettledOk = false
+
+/**
+ * Structured persistence outcome for one exec, reported on its done frame:
+ * what the save kept or dropped, why a save failed, and what the startup
+ * restore revived. The host surfaces this instead of guessing from logs.
+ */
+interface PersistenceStatus {
+  saved?: number
+  saveLost?: string[]
+  saveError?: string
+  restored?: number
+  restoreLost?: string[]
+}
+
+/** The restore status of this process's one startup restore, when it ran. */
+let restoreStatus: PersistenceStatus | undefined
 /**
  * Global keys present at boot: anything else on the process global is a
  * program-created binding and participates in the snapshot (sloppy-mode
@@ -143,9 +159,9 @@ function serializeRecord(
   return { saved, lost }
 }
 
-/** Atomically write the snapshot; a failure must never fail the run. */
-function saveSnapshot(): void {
-  if (snapshotSpec === null) return
+/** Atomically write the snapshot; a failure is REPORTED, never a run failure. */
+function saveSnapshot(): PersistenceStatus {
+  if (snapshotSpec === null) return {}
   const { path, maxBytes, maxEntryBytes } = snapshotSpec
   let tmp = ''
   try {
@@ -167,28 +183,33 @@ function saveSnapshot(): void {
     tmp = path + '.tmp'
     writeFileSync(tmp, JSON.stringify(doc), 'utf8')
     renameSync(tmp, path)
-  } catch {
+    return {
+      saved: Object.keys(stateRecord.saved).length + Object.keys(globalRecord.saved).length,
+      saveLost: [...stateRecord.lost, ...globalRecord.lost],
+    }
+  } catch (error: unknown) {
     try {
       if (tmp !== '') rmSync(tmp, { force: true })
     } catch { /* best-effort */ }
+    return { saveError: messageOf(error) }
   }
 }
 
 /** Restore the last saved namespace once; report revived and lost names. */
-function restoreSnapshot(): void {
-  if (snapshotSpec === null) return
+function restoreSnapshot(): PersistenceStatus {
+  if (snapshotSpec === null) return {}
   const { path } = snapshotSpec
-  if (!existsSync(path)) return
+  if (!existsSync(path)) return {}
   let doc: unknown
   try {
     doc = JSON.parse(readFileSync(path, 'utf8')) as unknown
   } catch (error) {
     logFrame(`[dsh-kernels] snapshot unreadable (restore skipped): ${messageOf(error)}`, 'stdout')
-    return
+    return {}
   }
   if (typeof doc !== 'object' || doc === null || (doc as { version?: unknown }).version !== SNAPSHOT_VERSION) {
     logFrame('[dsh-kernels] snapshot unreadable (restore skipped): unsupported snapshot format', 'stdout')
-    return
+    return {}
   }
   const snapshot = doc as {
     state?: { saved?: Record<string, string>; lost?: unknown }
@@ -221,6 +242,7 @@ function restoreSnapshot(): void {
     notice += ` (could not restore: ${shown}${lost.length > RESTORE_NOTICE_LIMIT ? ', ...' : ''})`
   }
   logFrame(notice, 'stdout')
+  return { restored, restoreLost: lost }
 }
 
 // --- per-run bookkeeping -----------------------------------------------------
@@ -351,8 +373,21 @@ function restoreGlobals(run: ActiveRun): void {
 const INTERRUPTED = new Error('run interrupted by SIGINT')
 INTERRUPTED.name = 'INTERRUPTED'
 
-/** Run one cell against this run's namespaces; settle the run when it finishes. */
-async function runCell(code: string, run: ActiveRun, namespaces: ExecNamespaceDescriptor[]): Promise<void> {
+/**
+ * Deliberate dynamic-import resolution for `await import(...)` inside a cell:
+ * builtins and URL specifiers pass straight through; relative and bare
+ * specifiers resolve against the run's working directory (process.cwd()
+ * follows the per-run cwd), not the runner's staging location.
+ */
+async function importDynamic(specifier: string): Promise<unknown> {
+  if (specifier.startsWith('node:') || specifier.includes('://')) return import(specifier)
+  const require = createRequire(join(process.cwd(), 'dsh-kernel-cell.js'))
+  const resolved = require.resolve(specifier, { paths: [process.cwd()] })
+  return import(pathToFileURL(resolved).href)
+}
+
+/** Run one cell; RETURN its done frame (the caller attaches persistence and emits). */
+async function runCell(code: string, run: ActiveRun, namespaces: ExecNamespaceDescriptor[]): Promise<Record<string, unknown>> {
   materializeNamespaces(run, namespaces)
   const interrupted = new Promise<never>((_resolve, reject) => { run.interrupt = () => { reject(INTERRUPTED) } })
   // Concatenation (not a template literal): the code is hostile user input and
@@ -361,26 +396,32 @@ async function runCell(code: string, run: ActiveRun, namespaces: ExecNamespaceDe
   // Construction can itself throw (a cell with invalid JavaScript syntax);
   // that is a program error, not a reason to lose the kernel, so it settles
   // the run instead of letting the exception escape and kill the runner.
-  let done = false
-  const finish = (frame: object): void => {
-    if (done) return
-    done = true
-    emit(frame)
-    if ((frame as { status?: unknown }).status === 'ok' && (frame as { cancelled?: unknown }).cancelled !== true) {
-      lastRunSettledOk = true
-    }
-  }
   let program: (...args: unknown[]) => unknown
   try {
+    // Erasable-only TypeScript stripping (types/annotations/interfaces): keeps
+    // the documented language promise without a real TS transform. Non-erasable
+    // syntax (enums, namespaces, parameter properties) throws here and settles
+    // the run as a syntax error — the tool text tells models to avoid it. The
+    // stripper parses as a MODULE, where a bare `return` is illegal, so the
+    // cell is wrapped as a module-level EXPRESSION first and the compiled body
+    // becomes `return <expr>;` — the same function-body semantics as before.
+    const prepared = stripTypeScriptTypes('(async () => {\n' + code + '\n})()', { mode: 'strip' })
     // `compileFunction` is V8's Function-constructor path without the implied-eval
     // surface: the same function-body semantics (including a `this` bound at
-    // call time), compilable up front so a syntax error settles the run.
-    program = compileFunction('return (async () => {\n' + code + '\n})()') as (...args: unknown[]) => unknown
+    // call time), compilable up front so a syntax error settles the run. The
+    // import callback makes `await import(...)` deliberate instead of a hard
+    // error; the kernel process runs with --experimental-vm-modules so the
+    // callback is honored. (The cast: @types/node narrows the loader's return
+    // to vm.Module/CJS Module, but Node itself also accepts a real namespace
+    // object, which is exactly what the passthrough import returns.)
+    const compileOptions = {
+      importModuleDynamically: (specifier: string): Promise<unknown> => importDynamic(specifier),
+    } as unknown as CompileFunctionOptions
+    program = compileFunction('return ' + prepared, [], compileOptions) as (...args: unknown[]) => unknown
   } catch (error: unknown) {
     const message = messageOf(error)
     emit({ type: 'error', id: run.id, ename: 'SyntaxError', evalue: message, traceback: [] })
-    finish({ type: 'done', id: run.id, status: 'error', executionCount: ++executionCount, message })
-    return
+    return { type: 'done', id: run.id, status: 'error', executionCount: ++executionCount, message }
   }
   try {
     const promise = program.call(globalThis) as Promise<unknown>
@@ -388,25 +429,22 @@ async function runCell(code: string, run: ActiveRun, namespaces: ExecNamespaceDe
     if (value === undefined) {
       // No completion value: `undefined` is the worker backend's convention for
       // a program that did not `return` anything, and the seam's value is optional.
-      finish({ type: 'done', id: run.id, status: 'ok', executionCount: ++executionCount })
-      return
+      return { type: 'done', id: run.id, status: 'ok', executionCount: ++executionCount }
     }
     const serialized = losslessValue(value)
     if (!serialized.ok) {
-      finish({ type: 'done', id: run.id, status: 'error', executionCount: ++executionCount, invalidOutput: true, message: 'program completion must be lossless JSON' })
-      return
+      return { type: 'done', id: run.id, status: 'error', executionCount: ++executionCount, invalidOutput: true, message: 'program completion must be lossless JSON' }
     }
-    finish({ type: 'done', id: run.id, status: 'ok', executionCount: ++executionCount, value: serialized.value })
+    return { type: 'done', id: run.id, status: 'ok', executionCount: ++executionCount, value: serialized.value }
   } catch (error: unknown) {
     if (error === INTERRUPTED) {
-      finish({ type: 'done', id: run.id, status: 'error', cancelled: true, executionCount: ++executionCount })
-      return
+      return { type: 'done', id: run.id, status: 'error', cancelled: true, executionCount: ++executionCount }
     }
     const message = messageOf(error)
     const stack = error instanceof Error && typeof error.stack === 'string' ? error.stack.split('\n') : []
     const ename = error instanceof Error ? error.name : 'Error'
     emit({ type: 'error', id: run.id, ename, evalue: message, traceback: stack })
-    finish({ type: 'done', id: run.id, status: 'error', executionCount: ++executionCount, message })
+    return { type: 'done', id: run.id, status: 'error', executionCount: ++executionCount, message }
   } finally {
     restoreGlobals(run)
   }
@@ -527,10 +565,10 @@ async function handleExec(message: ExecMessage): Promise<void> {
     }
   }
   const namespaces = Array.isArray(message.namespaces) ? message.namespaces : []
-  // Namespace persistence: swap in the session's spec (restore once per
-  // process), then persist after a successfully settled run.
+  // Namespace persistence: swap in the session's spec, restore once per
+  // process, persist after a successfully settled run, and REPORT the whole
+  // outcome on this run's done frame (persistence status, not logs alone).
   snapshotSpec = isSnapshotSpec(message.snapshot) ? message.snapshot : null
-  lastRunSettledOk = false
   const run: ActiveRun = {
     id: message.id,
     calls: new Map(),
@@ -541,10 +579,23 @@ async function handleExec(message: ExecMessage): Promise<void> {
   emit({ type: 'started', id: run.id })
   if (snapshotSpec !== null && !snapshotRestored) {
     snapshotRestored = true
-    restoreSnapshot()
+    restoreStatus = restoreSnapshot()
   }
-  await runCell(message.code, run, namespaces)
-  if (snapshotSpec !== null && lastRunSettledOk) saveSnapshot()
+  const frame = await runCell(message.code, run, namespaces)
+  const settledOk = frame.status === 'ok' && frame.cancelled !== true
+  let persistence: PersistenceStatus | undefined
+  if (restoreStatus !== undefined) {
+    persistence = { ...restoreStatus }
+    // The restore belongs to this process's first exec only; later done
+    // frames describe just their own save.
+    restoreStatus = undefined
+  }
+  if (snapshotSpec !== null && settledOk) {
+    const saved = saveSnapshot()
+    persistence = { ...(persistence ?? {}), ...saved }
+  }
+  if (persistence !== undefined) frame.persistence = persistence
+  emit(frame)
   // The run settled (normally, failed, or interrupted); a cancelled cell's
   // ghost keeps evaluating in the background, so later runs must not see it.
   if (active === run) active = null

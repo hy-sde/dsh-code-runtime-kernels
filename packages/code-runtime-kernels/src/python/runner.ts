@@ -219,9 +219,14 @@ class _RunnerState:
         # Namespace persistence (session snapshots): the spec of the CURRENT
         # exec, whether this process already restored once, and how the last
         # run settled (a snapshot is written only after a successful run).
+        # done-frame emission is DEFERRED (_pending_done) so the snapshot save
+        # happens BEFORE the done frame — the host reads the persistence
+        # statuses off the done frame, so save must precede emission.
         self.snapshot_spec: dict | None = None
         self.restored_once: bool = False
         self.last_status: str = "ok"
+        self.restore_status: dict | None = None
+        self.pending_done: dict | None = None
 
 
 _CURRENT_RID: contextvars.ContextVar[str | None] = contextvars.ContextVar("dsh_rid", default=None)
@@ -460,7 +465,9 @@ def _finish_run(
     cancelled: bool = False,
     invalid_output: bool = False,
     message: str = "",
-) -> None:
+) -> dict:
+    """Build (but do not emit) the done frame; the request handler emits it
+    after the snapshot save so the frame can carry the persistence statuses."""
     _STATE.last_status = "ok" if (status == "ok" and not cancelled) else "error"
     _STATE.execution_count += 1
     frame: dict = {
@@ -476,7 +483,8 @@ def _finish_run(
         frame["invalidOutput"] = True
     if message:
         frame["message"] = message
-    _emit(frame)
+    _STATE.pending_done = frame
+    return frame
 
 
 async def _await_code(code_obj: Any, ns: dict) -> Any:
@@ -793,8 +801,9 @@ def _collect_entries(spec: dict) -> tuple[dict, list[str]]:
     return entries, skipped
 
 
-def _save_snapshot(spec: dict) -> None:
-    """Write the current namespace atomically; a failure never fails the run."""
+def _save_snapshot(spec: dict) -> dict:
+    """Write the current namespace atomically; a failure never fails the run
+    but is REPORTED (saveError) instead of swallowed."""
     path = spec["path"]
     tmp = ""
     try:
@@ -806,19 +815,22 @@ def _save_snapshot(spec: dict) -> None:
         with open(tmp, "wb") as handle:
             handle.write(payload)
         os.replace(tmp, path)
-    except BaseException:
+        return {"saved": len(entries), "saveLost": list(skipped)}
+    except BaseException as exc:
         try:
             if tmp:
                 os.unlink(tmp)
         except OSError:
             pass
+        return {"saveError": f"{type(exc).__name__}: {exc}"}
 
 
-def _restore_snapshot(spec: dict, rid: str) -> None:
-    """Restore the last saved namespace once; report revived and lost names."""
+def _restore_snapshot(spec: dict, rid: str) -> dict:
+    """Restore the last saved namespace once; report revived and lost names
+    (also as the returned status, which rides the run's done frame)."""
     path = spec["path"]
     if not os.path.exists(path):
-        return
+        return {}
     try:
         with open(path, "rb") as handle:
             doc = pickle.loads(zlib.decompress(handle.read()))
@@ -829,7 +841,7 @@ def _restore_snapshot(spec: dict, rid: str) -> None:
             raise ValueError("snapshot entries missing")
     except BaseException as exc:  # noqa: BLE001 - a bad snapshot must not wedge the kernel
         _emit({"type": "log", "id": rid, "text": f"[dsh-kernels] snapshot unreadable (restore skipped): {exc}"})
-        return
+        return {}
     restored: list[str] = []
     lost = [name for name in doc.get("lost", []) if isinstance(name, str)]
     for name, record in entries.items():
@@ -845,6 +857,7 @@ def _restore_snapshot(spec: dict, rid: str) -> None:
             shown += ", ..."
         notice += f" (could not restore: {shown})"
     _emit({"type": "log", "id": rid, "text": notice})
+    return {"restored": len(restored), "restoreLost": lost}
 
 
 def _install_idle_sigint() -> None:
@@ -895,6 +908,8 @@ async def _handle_request_async(req: dict) -> None:
     if not isinstance(code, str):
         _emit({"type": "error", "id": rid, "ename": "ProtocolError", "evalue": "code must be a string", "traceback": []})
         _finish_run(rid, status="error", message="code must be a string")
+        _emit(_STATE.pending_done)
+        _STATE.pending_done = None
         return
     cwd = req.get("cwd")
     if isinstance(cwd, str):
@@ -921,7 +936,7 @@ async def _handle_request_async(req: dict) -> None:
     _STATE.snapshot_spec = snapshot if _is_snapshot_spec(snapshot) else None
     if _STATE.snapshot_spec is not None and not _STATE.restored_once:
         _STATE.restored_once = True
-        _restore_snapshot(_STATE.snapshot_spec, rid)
+        _STATE.restore_status = _restore_snapshot(_STATE.snapshot_spec, rid)
     _STATE.cancel_requested = False
     try:
         await _run_cell(code, rid, namespaces)
@@ -929,8 +944,24 @@ async def _handle_request_async(req: dict) -> None:
         _STATE.cancel_requested = False
         _finish_run(rid, status="error", cancelled=True)
     finally:
+        # Defensive: every path through _run_cell settles the run; if one ever
+        # escapes without a done frame, the host would otherwise wait forever.
+        if _STATE.pending_done is None:
+            _finish_run(rid, status="error", message="runner finished without a completion record")
+        # Snapshot save BEFORE the done frame: the host reads the persistence
+        # statuses off the done frame, so the save (and its failure) must have
+        # happened by the time the frame is emitted.
+        persistence: dict = {}
+        if _STATE.restore_status is not None:
+            persistence.update(_STATE.restore_status)
+            _STATE.restore_status = None
         if _STATE.snapshot_spec is not None and _STATE.last_status == "ok":
-            _save_snapshot(_STATE.snapshot_spec)
+            persistence.update(_save_snapshot(_STATE.snapshot_spec))
+        frame = _STATE.pending_done
+        _STATE.pending_done = None
+        if persistence and isinstance(frame, dict):
+            frame["persistence"] = persistence
+        _emit(frame)
 
 
 async def _main_async() -> None:

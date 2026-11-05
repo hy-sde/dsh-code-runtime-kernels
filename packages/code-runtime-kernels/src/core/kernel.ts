@@ -60,26 +60,63 @@ export interface KernelStartConfig {
   shutdownGraceMs: number
   /**
    * Confinement wrapper applied to the fully-assembled argv (command +
-   * argvPrefix + runner) just before spawn — e.g. the output of
+   * argvPrefix + runner) just before spawn — e.g. wrapping
    * {@link KernelSandboxProvider.confine} so the kernel launches under real
    * filesystem confinement (bwrap / landlock-run / seatbelt). Must fail
-   * closed: a non-enforcing return is the provider's bug, not a fallback.
-   * The wrapper becomes the process-group leader; the escalation ladder
-   * unwinds through it.
+   * closed: a rejection or a non-enforcing return is the provider's bug, not
+   * a fallback. The wrapper becomes the process-group leader; the escalation
+   * ladder unwinds through it.
    */
-  confine?: (argv: readonly string[]) => { argv: string[] }
+  confine?: (argv: readonly string[], signal?: AbortSignal) => Promise<{ argv: string[] }>
+  /**
+   * Cancellation for the confinement call itself (the triggering run's
+   * signal): an aborted or failing confine fails the start structured, never
+   * the host process.
+   */
+  signal?: AbortSignal
+  /**
+   * Upper bound on captured log bytes per run (combined output-budget
+   * enforcement happens at capture time, not just at finalization). When the
+   * cap is hit a truncation marker replaces further output; `undefined`
+   * disables the cap (tests).
+   */
+  captureCapBytes?: number
 }
 
 /**
  * The sandbox seam's confine capability, structurally typed (no runtime
  * dependency on `@deepseek-ai/dsh-sandbox`): wrap exact argv under a
- * file-effect policy, or fail closed. See the published seam for the contract.
+ * file-effect policy, or fail closed. ASYNC, matching the real harness
+ * provider (`confine(…): Promise<ConfinedArgv>`) — a synchronous stand-in is
+ * still accepted structurally only by tests; production providers resolve.
  */
+export interface KernelSandboxPolicy {
+  mode: 'read-only' | 'workspace-write'
+  workspaceRoot: string
+  /** Owning DSH session, when the run has one (forwarded to the provider). */
+  sessionId?: string
+}
+
 export interface KernelSandboxProvider {
   confine(
     argv: readonly string[],
-    policy: { mode: 'read-only' | 'workspace-write'; workspaceRoot: string },
-  ): { argv: string[] }
+    policy: KernelSandboxPolicy,
+    signal?: AbortSignal,
+  ): Promise<{ argv: string[] }>
+}
+
+/** Structured snapshot/persistence status reported by the runners. */
+export interface KernelPersistenceStatus {
+  /** Names persisted by the last successful run's save. */
+  saved?: number
+  /** Names dropped by the save (over the per-entry/total caps). */
+  saveLost?: string[]
+  /** Save failure cause, when the snapshot could not be written at all. */
+  saveError?: string
+  /** Names restored from the snapshot at kernel start. */
+  restored?: number
+  /** Snapshot names that could not be restored. */
+  restoreLost?: string[]
 }
 
 /** One in-flight run's host-side state. */
@@ -94,6 +131,13 @@ interface PendingRun {
   invalidOutput: boolean
   message: string
   killed: boolean
+  /** True when the run settled because the process died without host-initiated termination (crash → worker-exit). */
+  crashed?: boolean
+  /** Captured log bytes so far (capture-cap accounting). */
+  captureBytes: number
+  /** True once the capture cap has been hit and the marker emitted. */
+  captureTruncated: boolean
+  persistence?: KernelPersistenceStatus
   done: Promise<void>
   finalize: () => void
 }
@@ -115,6 +159,10 @@ export interface KernelExecResult {
   message: string
   /** True when the kernel had to be terminated to settle this run. */
   killed: boolean
+  /** True when the kernel process died without host-initiated termination (maps to `worker-exit`). */
+  crashed?: boolean
+  /** Snapshot persistence status when the run carried a snapshot spec. */
+  persistence?: KernelPersistenceStatus
 }
 
 /** The Node.js runner shipped as a package file (raw source in development, compiled ESM in the output). */
@@ -128,7 +176,10 @@ export function nodejsKernelProfile(command: string): KernelRuntimeProfile {
   return {
     key: 'typescript',
     command,
-    argvPrefix: ['--no-warnings'],
+    // --experimental-vm-modules: the runner's compileFunction import callback
+    // (deliberate dynamic-import resolution for cells) is honored only with
+    // this flag; without it `await import(...)` inside a cell hard-fails.
+    argvPrefix: ['--no-warnings', '--experimental-vm-modules'],
     runnerPath: RUNNER_PATH,
     prefix: 'dsh-code-runtime-kernels-nodejs',
     idPrefix: 'js-',
@@ -213,6 +264,22 @@ export function doneFailure(frame: DoneFrame): { ok: true } | { ok: false; error
 }
 
 /**
+ * Validate a runner-reported persistence status field by field (hostile-peer
+ * revalidation, like every other frame field): junk yields `undefined`.
+ */
+function parsePersistence(raw: unknown): KernelPersistenceStatus | undefined {
+  if (typeof raw !== 'object' || raw === null) return undefined
+  const record = raw as Record<string, unknown>
+  const out: KernelPersistenceStatus = {}
+  if (typeof record.saved === 'number' && Number.isFinite(record.saved)) out.saved = record.saved
+  if (Array.isArray(record.saveLost)) out.saveLost = record.saveLost.filter((entry): entry is string => typeof entry === 'string')
+  if (typeof record.saveError === 'string') out.saveError = record.saveError
+  if (typeof record.restored === 'number' && Number.isFinite(record.restored)) out.restored = record.restored
+  if (Array.isArray(record.restoreLost)) out.restoreLost = record.restoreLost.filter((entry): entry is string => typeof entry === 'string')
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
+/**
  * Parse one kernel frame. The peer runs MODEL CODE and can emit anything, so
  * everything is re-validated and rebuilt field by field; junk returns
  * `undefined` and is dropped (a throw here would crash the host).
@@ -256,6 +323,8 @@ export function parseKernelFrame(raw: unknown): KernelFrame | undefined {
       if (message.cancelled === true) frame.cancelled = true
       if (message.invalidOutput === true) frame.invalidOutput = true
       if (typeof message.message === 'string') frame.message = message.message
+      const persistence = parsePersistence(message.persistence)
+      if (persistence !== undefined) frame.persistence = persistence
       return frame
     }
     default: return undefined
@@ -274,13 +343,19 @@ export class KernelHost {
   #runs = new Map<string, PendingRun>()
   #ready!: Promise<void>
   #settleReady!: () => void
+  #failReady!: (error: Error) => void
   #exited: Promise<number>
+  #settleExited!: (code: number) => void
   #alive = true
   #disposed = false
   #interruptEscalationMs: number
   #shutdownGraceMs: number
+  /** Per-run captured-output cap in bytes; `undefined` disables capping. */
+  #captureCapBytes: number | undefined
   /** Last stdin failure cause (omp #14196/#14199), surfaced in the next write's rejection. */
   #stdinFailure: string | undefined
+  /** First spawn-level failure (missing executable, …), when any. */
+  #spawnFailure: string | undefined
 
   /**
    * Spawn a kernel per the profile and wait for the bootstrap handshake.
@@ -319,7 +394,22 @@ export class KernelHost {
     // leader: anything it spawns stays in ITS process group, so a shutdown can
     // sweep the whole tree via killProcessGroup (the #7714 orphan fix) instead
     // of leaving grandchildren holding the kernel's pipes open.
-    const wrapped: readonly string[] = config.confine !== undefined ? config.confine(fullArgv).argv : fullArgv
+    // The confine seam is async and fail-closed: a rejection (provider bug,
+    // sandbox unavailable, caller abort) is a structured start failure — it
+    // must never reach `spawn` as a bogus argv and never crash the host.
+    let wrapped: readonly string[]
+    if (config.confine !== undefined) {
+      try {
+        wrapped = (await config.confine(fullArgv, config.signal)).argv
+      } catch (error: unknown) {
+        throw new Error(`${profile.prefix}: sandbox confinement failed: ${tryMessageOf(error)}`)
+      }
+      if (!Array.isArray(wrapped) || wrapped.length === 0 || wrapped.some(entry => typeof entry !== 'string')) {
+        throw new Error(`${profile.prefix}: sandbox confinement returned a malformed argv`)
+      }
+    } else {
+      wrapped = fullArgv
+    }
     const proc = spawn(wrapped[0] ?? profile.command, wrapped.slice(1), {
       cwd: config.cwd,
       env: { ...(config.env ?? process.env), ...profile.env },
@@ -370,6 +460,7 @@ export class KernelHost {
     this.#stagedPath = stagedPath
     this.#interruptEscalationMs = config.interruptEscalationMs
     this.#shutdownGraceMs = config.shutdownGraceMs
+    this.#captureCapBytes = config.captureCapBytes
     proc.stderr?.setEncoding('utf8')
     // stdout stays raw bytes: frames are split at the byte level (lines.ts),
     // decoded per complete line — multibyte-safe across chunk boundaries.
@@ -384,9 +475,42 @@ export class KernelHost {
     // cause for the next write's rejection; the kernel's retirement stays
     // with the write path that observed the failure.
     proc.stdin?.on('error', (error: Error) => { this.#stdinFailure ??= messageOf(error) })
-    this.#exited = new Promise<number>((resolve) => { proc.once('exit', (code) => { resolve(code ?? 0) }) })
+    // A failed SPAWN (missing executable, EACCES, …) emits an 'error' event
+    // and NO 'exit' event. Without this listener the unhandled event kills
+    // the whole host process (the review's finding: `nodePath: /nonexistent`
+    // took the harness down); with it, the failure is structured: runs are
+    // settled as killed, the start handshake rejects through #failReady, and
+    // shutdown/kill paths see #exited settled (there is no exit event to wait
+    // for) instead of hanging on the grace race.
+    proc.on('error', (error: Error) => { this.#onSpawnError(error) })
+    this.#exited = new Promise<number>((resolve) => { this.#settleExited = resolve })
+    proc.once('exit', (code) => { this.#settleExited(code ?? 0) })
     void this.#exited.then((code) => { this.#onProcessExit(code) })
-    this.#ready = new Promise<void>((resolve) => { this.#settleReady = resolve })
+    this.#ready = new Promise<void>((resolve, reject) => {
+      this.#settleReady = resolve
+      this.#failReady = reject
+    })
+  }
+
+  /**
+   * Spawn-level failure: no process exists (so there is nothing to signal and
+   * no 'exit' event coming). Mark the host dead, settle #exited with a
+   * synthetic code, settle every admitted run as killed, and reject the
+   * startup handshake.
+   */
+  #onSpawnError(error: Error): void {
+    const cause = messageOf(error)
+    this.#spawnFailure ??= cause
+    this.#alive = false
+    this.#settleExited(-1)
+    for (const run of [...this.#runs.values()]) {
+      run.status = 'error'
+      run.message = `${this.profile.label} process failed: ${cause}`
+      run.killed = true
+      run.finalize()
+    }
+    this.#runs.clear()
+    this.#failReady(new Error(`${this.profile.prefix}: kernel process failed to spawn: ${cause}`))
   }
 
   /** The process is healthy and accepting runs. */
@@ -426,6 +550,8 @@ export class KernelHost {
       invalidOutput: false,
       message: '',
       killed: false,
+      captureBytes: 0,
+      captureTruncated: false,
       done: Promise.resolve(),
       finalize: () => {},
     }
@@ -491,7 +617,28 @@ export class KernelHost {
       invalidOutput: run.invalidOutput,
       message: run.message,
       killed: run.killed,
+      ...run.crashed ? { crashed: true } : {},
+      ...run.persistence !== undefined ? { persistence: run.persistence } : {},
     }
+  }
+
+  /**
+   * Append one captured-output chunk with the per-run capture cap applied:
+   * once the cap is hit, a single marker line is retained and everything
+   * after it is discarded (host memory stays bounded even when the runner's
+   * own output accounting is bypassed, e.g. child-process stdout forwarded
+   * as kernel output).
+   */
+  #appendLog(run: PendingRun, text: string, stream: string): void {
+    const cap = this.#captureCapBytes
+    if (cap === undefined || run.captureTruncated) return
+    if (run.captureBytes + Buffer.byteLength(text) > cap) {
+      run.captureTruncated = true
+      run.logs.push({ text: `[dsh-kernels] output capture truncated at ${cap} bytes; further kernel output discarded`, stream: 'stderr' })
+      return
+    }
+    run.captureBytes += Buffer.byteLength(text)
+    run.logs.push({ text, stream })
   }
 
   /** Request cancellation of the in-flight run via SIGINT, escalating to termination. */
@@ -601,6 +748,10 @@ export class KernelHost {
       run.status = 'error'
       run.message = `${this.profile.label} exited with code ${code} before completing`
       run.killed = true
+      // Host-initiated terminations (#interrupt escalation, shutdown) set
+      // `cancelled` before the process dies; a spontaneous death of a run the
+      // host did not cancel is a crash → surfaced as `worker-exit`.
+      if (!run.cancelled) run.crashed = true
       run.finalize()
     }
     // The staged scratch script has served its purpose; remove it once the
@@ -618,7 +769,7 @@ export class KernelHost {
   #ingestStray(text: string): void {
     if (text.length === 0) return
     for (const run of [...this.#runs.values()]) {
-      if (!run.killed) run.logs.push({ text, stream: 'stderr' })
+      if (!run.killed) this.#appendLog(run, text, 'stderr')
     }
   }
 
@@ -655,7 +806,7 @@ export class KernelHost {
         return
       case 'log': {
         const run = this.#runs.get(frame.id)
-        if (run !== undefined) run.logs.push({ text: frame.text, stream: frame.stream ?? 'stdout' })
+        if (run !== undefined) this.#appendLog(run, frame.text, frame.stream ?? 'stdout')
         return
       }
       case 'call': {
@@ -676,6 +827,7 @@ export class KernelHost {
         if (frame.cancelled === true) run.cancelled = true
         if (frame.invalidOutput === true) run.invalidOutput = true
         if (frame.message !== undefined) run.message = frame.message
+        if (frame.persistence !== undefined) run.persistence = frame.persistence
         run.finalize()
         return
       }

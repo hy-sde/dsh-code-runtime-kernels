@@ -139,6 +139,18 @@ export interface DoneFrame {
   invalidOutput?: boolean
   /** The failure or protocol message, when any. */
   message?: string
+  /**
+   * Structured snapshot/persistence status (saved/restored counts, lost
+   * names, save failure cause), present when the run carried a snapshot
+   * spec — the durable record of what actually persisted.
+   */
+  persistence?: {
+    saved?: number
+    saveLost?: string[]
+    saveError?: string
+    restored?: number
+    restoreLost?: string[]
+  }
 }
 
 /** Every frame the kernel sends. */
