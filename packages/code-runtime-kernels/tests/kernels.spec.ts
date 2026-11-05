@@ -193,10 +193,14 @@ describe('persistent kernels — failure taxonomy', () => {
           ? 'import os, sys\nsys.stdout.flush()\nos._exit(137)'
           : 'process.stdout.write("")\nprocess.exit(137)'
         const dead = await manager.run({ language, sessionId, code: killer })
-        // A killed kernel surfaces as an abort with the exit message.
-        expect(dead.error?.kind).toBe('abort')
-        // The registry replaced the dead kernel and retried once; the next run
-        // on the SAME session must come back alive with fresh state.
+        // A worker that died mid-run is a `worker-exit`, NOT an abort, and the
+        // run is never replayed: the registry retires the dead kernel and the
+        // caller is warned that external effects may already have happened.
+        expect(dead.error?.kind).toBe('worker-exit')
+        expect(dead.error?.message).toContain('exited with code 137')
+        expect(dead.error?.message).toContain('NOT retried')
+        // The next run on the SAME session starts on a fresh kernel with
+        // fresh state (the dead one was retired, not reused).
         const alive = await manager.run({
           language,
           sessionId,

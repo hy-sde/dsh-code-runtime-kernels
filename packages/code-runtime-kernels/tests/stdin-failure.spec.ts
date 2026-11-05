@@ -140,9 +140,10 @@ describe('KernelHost — stdin pipe failures (omp #14196/#14199)', () => {
     // The binding kills the caller's own process group mid-call (the kernel
     // is a session leader via setsid, so -pid is exactly its group): the
     // reply write then races the kernel's death and must fail harmlessly —
-    // no unhandled rejection, the run settles killed, and the session
-    // registry's replace-and-retry recovery re-runs the program on a fresh
-    // kernel where the same binding hits the no-op branch.
+    // no unhandled rejection, the run settles as a worker-exit and is NOT
+    // replayed (re-executing model code could double external effects), and
+    // the NEXT invocation on the same session runs on a fresh kernel where
+    // the same binding hits the no-op branch.
     let kills = 0
     const bindings: PtcBindingNamespace[] = [{
       global: 'test',
@@ -160,19 +161,32 @@ describe('KernelHost — stdin pipe failures (omp #14196/#14199)', () => {
       snapshotDir: tempSnapshotDir(),
     })
     try {
-      const result = await manager.run({
+      // No replay: the first run settles as a worker-exit (the kernel died
+      // settling the binding call), the registry retires the dead kernel,
+      // and the caller is warned its code may have partially applied. The
+      // racing reply write must NOT surface as an unhandled rejection.
+      const first = await manager.run({
         language: 'typescript',
         sessionId: 'pipe-recovery',
         code: 'await test.dieOnce({ pid: process.pid })\nreturn 42',
         bindings,
       })
-      expect(result.error).toBeUndefined()
-      expect(result.value).toBe(42)
-      // The retried run executed on a REPLACED kernel: a fresh session's
-      // execution count, not the killed kernel's.
-      expect(result.executionCount).toBe(1)
+      expect(first.error?.kind).toBe('worker-exit')
+      expect(first.error?.message).toContain('NOT retried')
       await delay(50)
       expect(fatal.collected).toEqual([])
+      // The SECOND invocation runs on the replaced kernel: the binding hits
+      // its no-op branch and the program completes for real.
+      const second = await manager.run({
+        language: 'typescript',
+        sessionId: 'pipe-recovery',
+        code: 'await test.dieOnce({ pid: process.pid })\nreturn 42',
+        bindings,
+      })
+      expect(second.error).toBeUndefined()
+      expect(second.value).toBe(42)
+      // A fresh session's execution count, not the killed kernel's.
+      expect(second.executionCount).toBe(1)
     } finally {
       fatal.done()
       await manager.teardown()

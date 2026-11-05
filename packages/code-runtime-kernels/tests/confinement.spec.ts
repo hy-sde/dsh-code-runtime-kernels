@@ -18,10 +18,10 @@ describe('sandbox confinement', () => {
     const calls: Array<{ argv: string[]; mode: string; root: string }> = []
     const root = tempSnapshotDir()
     const provider = {
-      confine: (argv: readonly string[], policy: { mode: string; workspaceRoot: string }) => {
+      confine: async (argv: readonly string[], policy: { mode: string; workspaceRoot: string }) => {
         calls.push({ argv: [...argv], mode: policy.mode, root: policy.workspaceRoot })
         // Wrap through env(1) as a stand-in runner: the real provider wraps
-        // via bwrap/landlock-run/seatbelt.
+        // via bwrap/landlock-run/seatbelt (and resolves asynchronously).
         return { argv: ['/usr/bin/env', ...argv] }
       },
     }
@@ -58,7 +58,7 @@ describe('sandbox confinement', () => {
       snapshotDir: `${root}/snap`,
       sandboxConfinement: true,
       sandboxProvider: {
-        confine: (argv, policy) => {
+        confine: async (argv, policy) => {
           seen = policy.mode
           return { argv: ['/usr/bin/env', ...argv] }
         },
@@ -85,7 +85,7 @@ describe('sandbox confinement', () => {
     expect(() => new KernelManager({
       languages: ['python'],
       sandboxConfinement: true,
-      sandboxProvider: { confine: argv => ({ argv: [...argv] }) },
+      sandboxProvider: { confine: async argv => ({ argv: [...argv] }) },
       sandboxWorkspaceRoot: '/tmp/confined-root',
       snapshotDir: '/tmp/elsewhere-snap',
     })).toThrow(/snapshotDir/)
@@ -100,7 +100,7 @@ describe('sandbox confinement', () => {
       sandboxConfinement: true,
       sandboxMode: 'read-only',
       sandboxProvider: {
-        confine: (argv, policy) => {
+        confine: async (argv, policy) => {
           seen = policy.mode
           return { argv: ['/usr/bin/env', ...argv] }
         },
