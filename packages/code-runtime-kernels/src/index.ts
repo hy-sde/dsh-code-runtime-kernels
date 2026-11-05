@@ -354,7 +354,7 @@ export class KernelManager {
   readonly #registries = new Map<'python' | 'typescript', SessionRegistry>()
   readonly #ledgerFactory: () => OutputLedger
   /** Async confinement seam (matches the real sandbox provider; see kernel.ts). */
-  readonly #confine: ((argv: readonly string[], signal?: AbortSignal) => Promise<{ argv: string[] }>) | undefined
+  readonly #confine: ((argv: readonly string[], signal?: AbortSignal, sessionId?: string) => Promise<{ argv: string[] }>) | undefined
   /** In-flight one-shot kernels: every admitted run is tracked so teardown quiesces them too. */
   readonly #oneshots = new Set<Promise<unknown>>()
   /** Python commands whose probe already passed this manager's lifetime; failures are never cached. */
@@ -439,15 +439,20 @@ export class KernelManager {
       const provider = resolved.sandboxProvider
       const root = resolve(resolved.sandboxWorkspaceRoot)
       // The real sandbox seam is async and fail-closed (see KernelStartConfig);
-      // a rejection surfaces as a structured kernel-start failure.
-      this.#confine = (argv, signal) => provider.confine(argv, { mode: resolved.sandboxMode, workspaceRoot: root }, signal)
+      // a rejection surfaces as a structured kernel-start failure. sessionId
+      // scopes the policy to the owning session (per-session ACL grants).
+      this.#confine = (argv, signal, sessionId) => provider.confine(argv, {
+        mode: resolved.sandboxMode,
+        workspaceRoot: root,
+        ...sessionId !== undefined ? { sessionId } : {},
+      }, signal)
     }
     this.#config = resolved
     this.#ledgerFactory = () => new OutputLedger(resolved.maxOutputBytes, resolved.maxOutputLineChars)
     for (const language of resolved.languages) {
       this.#registries.set(language, new SessionRegistry({
         label: language === 'python' ? 'python kernel' : 'nodejs kernel',
-        start: () => this.#startKernel(language === 'python' ? 'python' : 'typescript'),
+        start: (signal, sessionId) => this.#startKernel(language === 'python' ? 'python' : 'typescript', signal, sessionId),
         sessionIdleMs: resolved.sessionIdleMs,
         // The JavaScript runner's cancellation leaves the abandoned cell
         // evaluating as a ghost inside the kernel, so an aborted JS run
@@ -554,13 +559,13 @@ export class KernelManager {
     }
   }
 
-  #startKernel(language: 'python' | 'typescript'): Promise<KernelHost> {
+  #startKernel(language: 'python' | 'typescript', signal?: AbortSignal, sessionId?: string): Promise<KernelHost> {
     return language === 'python'
-      ? this.#startPython()
-      : this.#startNodejs()
+      ? this.#startPython(signal, sessionId)
+      : this.#startNodejs(signal, sessionId)
   }
 
-  async #startPython(): Promise<KernelHost> {
+  async #startPython(signal?: AbortSignal, sessionId?: string): Promise<KernelHost> {
     const command = await this.#resolvePythonCommand()
     const profile = {
       key: 'python' as const,
@@ -579,7 +584,7 @@ export class KernelManager {
       idPrefix: 'py-',
       label: 'python kernel',
     }
-    return KernelHost.start(profile, this.#startConfig())
+    return KernelHost.start(profile, this.#startConfig(signal, sessionId))
   }
 
   /** Resolve the python command for a kernel start (config.pythonPath first, then PATH candidates). */
@@ -590,14 +595,14 @@ export class KernelManager {
     })
   }
 
-  #startNodejs(): Promise<KernelHost> {
+  #startNodejs(signal?: AbortSignal, sessionId?: string): Promise<KernelHost> {
     return KernelHost.start(
       nodejsKernelProfile(this.#config.nodePath ?? 'node'),
-      this.#startConfig(),
+      this.#startConfig(signal, sessionId),
     )
   }
 
-  #startConfig() {
+  #startConfig(signal?: AbortSignal, sessionId?: string) {
     return {
       cwd: process.cwd(),
       // The kernel must not see harness-internal state: DSH_* variables are
@@ -607,6 +612,11 @@ export class KernelManager {
       startupTimeoutMs: this.#config.startupTimeoutMs,
       interruptEscalationMs: this.#config.interruptEscalationMs,
       shutdownGraceMs: this.#config.shutdownGraceMs,
+      // The triggering run's abort signal: an aborted caller cancels the
+      // confine await instead of stalling kernel start indefinitely.
+      ...signal !== undefined ? { signal } : {},
+      // Owning session id, when the run has one (per-session sandbox policy).
+      ...sessionId !== undefined ? { sessionId } : {},
       // Host-side per-run capture cap: the kernel log ring is bounded by the
       // same byte budget as the result envelope, so a log bomb cannot balloon
       // host memory before the ledger clips the result.
@@ -641,7 +651,7 @@ export class KernelManager {
     signal: AbortSignal,
     cwd?: string,
   ): Promise<KernelExecResult> {
-    const kernel = await this.#startKernel(language)
+    const kernel = await this.#startKernel(language, signal)
     try {
       return await kernel.execute(randomUUID(), code, bindings, {
         signal,
@@ -816,6 +826,16 @@ export interface RunKernelCodeArgs {
 /** The value `run_kernel_code` resolves: the seam's result envelope plus the execution count. */
 export type RunKernelCodeValue = KernelRunResult
 
+/**
+ * Bounded preview of a persistence lost-name list: first PERSISTENCE_PREVIEW
+ * names plus the remainder count (the runners' own notice caps at 12).
+ */
+function previewNames(names: readonly string[]): string {
+  const LIMIT = 12
+  const head = names.slice(0, LIMIT).join(', ')
+  return names.length > LIMIT ? `${head}, … (+${names.length - LIMIT} more)` : head
+}
+
 /** Render the result for the model: successful value, or the failure line. */
 function renderResult(value: RunKernelCodeValue): string {
   const head: string[] = []
@@ -829,10 +849,15 @@ function renderResult(value: RunKernelCodeValue): string {
   }
   if (value.executionCount !== undefined) head.push(`execution_count: ${value.executionCount}`)
   if (value.persistence !== undefined) {
+    // The runners may report dozens of skipped names (unpicklable/cap-hit
+    // namespaces); render a bounded preview so a heavy session cannot turn
+    // every run's tool text into multi-KB noise.
     const bits = [
       ...value.persistence.saveError !== undefined ? [`save error: ${value.persistence.saveError}`] : [],
-      ...(value.persistence.saveLost ?? []).length > 0 ? [`lost at save: ${value.persistence.saveLost?.join(', ')}`] : [],
-      ...(value.persistence.restoreLost ?? []).length > 0 ? [`lost at restore: ${value.persistence.restoreLost?.join(', ')}`] : [],
+      ...(value.persistence.saveLost ?? []).length > 0
+        ? [`lost at save: ${previewNames(value.persistence.saveLost ?? [])}`] : [],
+      ...(value.persistence.restoreLost ?? []).length > 0
+        ? [`lost at restore: ${previewNames(value.persistence.restoreLost ?? [])}`] : [],
     ]
     if (bits.length > 0) head.push(`persistence: ${bits.join('; ')}`)
   }
@@ -865,7 +890,15 @@ export function runKernelCodeMeta(value: RunKernelCodeValue): RunKernelCodeMeta 
   if (value.value !== undefined) meta.value = value.value
   if (value.error !== undefined) meta.error = { kind: value.error.kind, message: value.error.message }
   if (value.executionCount !== undefined) meta.executionCount = value.executionCount
-  if (value.persistence !== undefined) meta.persistence = { ...value.persistence }
+  if (value.persistence !== undefined) {
+    // Cap the lost-name lists too: the replay payload is persisted and
+    // re-sent every turn, so a heavy namespace must not bloat it.
+    meta.persistence = {
+      ...value.persistence,
+      ...(value.persistence.saveLost !== undefined ? { saveLost: value.persistence.saveLost.slice(0, 12) } : {}),
+      ...(value.persistence.restoreLost !== undefined ? { restoreLost: value.persistence.restoreLost.slice(0, 12) } : {}),
+    }
+  }
   return meta
 }
 

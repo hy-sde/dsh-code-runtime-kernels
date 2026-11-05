@@ -47,7 +47,7 @@ interface ReplyMessage {
   message?: string
   name?: string
 }
-import { createRequire, stripTypeScriptTypes } from 'node:module'
+import { createRequire, isBuiltin, stripTypeScriptTypes } from 'node:module'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -375,12 +375,13 @@ INTERRUPTED.name = 'INTERRUPTED'
 
 /**
  * Deliberate dynamic-import resolution for `await import(...)` inside a cell:
- * builtins and URL specifiers pass straight through; relative and bare
- * specifiers resolve against the run's working directory (process.cwd()
- * follows the per-run cwd), not the runner's staging location.
+ * builtins (with or without the `node:` prefix) and any scheme'd specifier
+ * (`data:`, `https:`, …) pass straight through to import(); relative and bare
+ * package specifiers resolve against the run's working directory
+ * (process.cwd() follows the per-run cwd), not the runner's staging location.
  */
 async function importDynamic(specifier: string): Promise<unknown> {
-  if (specifier.startsWith('node:') || specifier.includes('://')) return import(specifier)
+  if (isBuiltin(specifier) || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(specifier)) return import(specifier)
   const require = createRequire(join(process.cwd(), 'dsh-kernel-cell.js'))
   const resolved = require.resolve(specifier, { paths: [process.cwd()] })
   return import(pathToFileURL(resolved).href)

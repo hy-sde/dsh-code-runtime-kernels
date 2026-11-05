@@ -9,13 +9,15 @@
 
 import { chmodSync } from 'node:fs'
 import { setTimeout as delay } from 'node:timers/promises'
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it } from 'vitest'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { Context } from '@deepseek-ai/cordis'
 import * as Kernels from '../src/index.ts'
 import { cleanTempSnapshotDirs, tempSnapshotDir } from './test-util.ts'
+
+afterEach(() => { cleanTempSnapshotDirs() })
 
 function makeManager(overrides: Record<string, unknown> = {}): Kernels.KernelManager {
   return new Kernels.KernelManager({
@@ -52,10 +54,12 @@ describe('review regressions — idle scheduling (finding 6)', () => {
   it('never reaps a session whose queue still holds pending runs', async () => {
     await withManager(async (manager) => {
       const sessionId = 'idle-queue'
-      // Run 1 executes longer than the idle window while run 2 waits queued.
-      // The old code armed run 2's idle deadline when run 1's admission
-      // settled, killing run 2 mid-execution; the deadline may only fire at
-      // queue drain now.
+      // Run 1 executes longer than the idle window while run 2 waits queued,
+      // and run 2 ITSELF outlives the window: the old code armed run 2's idle
+      // deadline when run 1's admission settled, so a quick run 2 finished
+      // before the timer fired and the test could not fail pre-fix. With run 2
+      // sleeping 0.4s the stale 250ms deadline would kill it mid-execution;
+      // the deadline may only fire at queue drain now.
       const first = manager.run({
         language: 'python',
         sessionId,
@@ -64,13 +68,13 @@ describe('review regressions — idle scheduling (finding 6)', () => {
       const second = manager.run({
         language: 'python',
         sessionId,
-        code: '2 + 2',
+        code: "import time\ntime.sleep(0.4)\n'second'",
       })
       const [one, two] = await Promise.all([first, second])
       expect(one.error).toBeUndefined()
       expect(one.value).toBe('first')
       expect(two.error).toBeUndefined()
-      expect(two.value).toBe(4)
+      expect(two.value).toBe('second')
       // After the queue drains the idle deadline is live again: a later run
       // still works (fresh or reaped kernel alike).
       const third = await manager.run({ language: 'python', sessionId, code: '3 + 3' })
@@ -177,6 +181,24 @@ describe('review regressions — snapshot persistence status (finding 8)', () =>
     })
   })
 
+  it('runs already-queued siblings after a mid-queue kernel death instead of invalidating them', async () => {
+    await withManager(async (manager) => {
+      const sessionId = 'queue-death'
+      // Two admissions race on one session; the executing kernel dies under
+      // the first run. The old fix retired the session by DELETING the
+      // registry entry, which made the queued sibling reject with "session
+      // invalidated while acquiring kernel" without ever executing. The
+      // retirement must keep the entry (chain + pending count intact) and
+      // only drop the kernel.
+      const first = manager.run({ language: 'python', sessionId, code: 'import os\nos._exit(137)' })
+      const second = manager.run({ language: 'python', sessionId, code: "'sibling-ran'" })
+      const [one, two] = await Promise.all([first, second])
+      expect(one.error?.kind).toBe('worker-exit')
+      expect(two.error).toBeUndefined()
+      expect(two.value).toBe('sibling-ran')
+    })
+  })
+
   it('surfaces a snapshot save failure instead of suppressing it', async () => {
     // Running as root ignores directory write bits — skip there.
     if (typeof process.getuid === 'function' && process.getuid() === 0) return
@@ -199,10 +221,12 @@ describe('review regressions — TypeScript truthfulness (finding 7)', () => {
     await withManager(async (manager) => {
       const result = await manager.run({
         language: 'typescript',
-        code: "const n: number = 41\nconst fs = await import('node:fs')\nreturn { n, t: typeof fs.readFileSync }",
+        // Bare builtins (no `node:` prefix) must resolve too — require.resolve
+        // would turn them into a bogus file path under the run directory.
+        code: "const n: number = 41\nconst fs = await import('node:fs')\nconst p = await import('path')\nreturn { n, t: typeof fs.readFileSync, j: typeof p.join }",
       })
       expect(result.error).toBeUndefined()
-      expect(result.value).toEqual({ n: 41, t: 'function' })
+      expect(result.value).toEqual({ n: 41, t: 'function', j: 'function' })
     })
   })
 

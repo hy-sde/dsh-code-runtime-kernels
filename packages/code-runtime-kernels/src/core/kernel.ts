@@ -67,13 +67,18 @@ export interface KernelStartConfig {
    * a fallback. The wrapper becomes the process-group leader; the escalation
    * ladder unwinds through it.
    */
-  confine?: (argv: readonly string[], signal?: AbortSignal) => Promise<{ argv: string[] }>
+  confine?: (argv: readonly string[], signal?: AbortSignal, sessionId?: string) => Promise<{ argv: string[] }>
   /**
    * Cancellation for the confinement call itself (the triggering run's
    * signal): an aborted or failing confine fails the start structured, never
    * the host process.
    */
   signal?: AbortSignal
+  /**
+   * Owning DSH session id, when the run belongs to one — forwarded into the
+   * confinement policy so per-session sandbox grants apply.
+   */
+  sessionId?: string
   /**
    * Upper bound on captured log bytes per run (combined output-budget
    * enforcement happens at capture time, not just at finalization). When the
@@ -400,7 +405,7 @@ export class KernelHost {
     let wrapped: readonly string[]
     if (config.confine !== undefined) {
       try {
-        wrapped = (await config.confine(fullArgv, config.signal)).argv
+        wrapped = (await config.confine(fullArgv, config.signal, config.sessionId)).argv
       } catch (error: unknown) {
         throw new Error(`${profile.prefix}: sandbox confinement failed: ${tryMessageOf(error)}`)
       }

@@ -43,7 +43,7 @@ export interface SessionRegistryConfig {
   /** Label for error messages (e.g. `python kernel`). */
   label: string
   /** Spawn a fresh kernel for a newly acquired session (provider-resolved executable + timeouts). */
-  start: () => Promise<KernelHost>
+  start: (signal?: AbortSignal, sessionId?: string) => Promise<KernelHost>
   /** Reap a session whose kernel sits unused for this long; 0 disables. */
   sessionIdleMs: number
   /**
@@ -179,6 +179,12 @@ export class SessionRegistry {
     if (session === undefined || session.kernel === null) return
     clearTimeout(session.idleTimer)
     session.idleTimer = setTimeout(() => {
+      // Re-check at fire time: a run admitted after this deadline was armed
+      // may still be executing, and close() must never kill it mid-run. The
+      // deadline is only legitimate when the queue has drained again.
+      if (this.#sessions.get(sessionId) !== session) return
+      if (session.pending > 0) return
+      if (session.kernel === null) return
       void this.close(sessionId)
     }, this.#config.sessionIdleMs)
     session.idleTimer.unref()
@@ -205,7 +211,7 @@ export class SessionRegistry {
     if (this.#sessions.get(sessionId) !== session) {
       throw new Error(`${this.#config.label} session invalidated while acquiring kernel`)
     }
-    const kernel = await this.#config.start()
+    const kernel = await this.#config.start(signal, sessionId)
     if (this.#disposed) {
       await kernel.shutdown().catch(() => {})
       this.#assertNotDisposed()
@@ -291,8 +297,11 @@ export class SessionRegistry {
     // would see. The next invocation starts fresh (restoring the last saved
     // snapshot, when snapshots are on).
     if (first.cancelled && callerAborted() && this.#config.retireOnCancel === true) {
+      // Keep the registry entry: earlier admissions of this session are still
+      // chained on THIS session object, and deleting the entry would make
+      // their identity check reject ("session invalidated") without running.
+      // `kernel = null` already forces the next invocation onto a fresh kernel.
       session.kernel = null
-      this.#sessions.delete(sessionId)
       await kernel.shutdown().catch(() => {})
       return first
     }
@@ -300,10 +309,10 @@ export class SessionRegistry {
     // run is NEVER retried: re-executing model code the caller did not ask to
     // re-run would double external effects (files appended twice, requests
     // duplicated). `crashed` lets the host surface the worker-exit warning;
-    // the next invocation starts on a fresh kernel.
+    // the next invocation starts on a fresh kernel. The registry entry stays
+    // (queued siblings keep their chain and pending count).
     if (first.killed || !kernel.isAlive()) {
       session.kernel = null
-      this.#sessions.delete(sessionId)
       await kernel.shutdown().catch(() => {})
       return first
     }
