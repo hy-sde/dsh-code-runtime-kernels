@@ -34,6 +34,10 @@
 
 所有行 id 带 `hy-sde-` 前缀以避免与内置行冲突（重复的 loader id 会导致启动失败）。随后模型即看到 `run_kernel_code` 工具。
 
+## 从 0.2.1-rc.5 升级
+
+独立安装需满足新增的 `@deepseek-ai/dsh-subprocess` peer；受支持的 DSH profile 已自带该包。`KernelManager.run` 保留 output-limit 回调的首个 `content` 参数，并新增可选的第二个 `{ complete }` 参数，现有回调无需改源码。
+
 ## 配置
 
 | 键 | 默认 | 含义 |
@@ -44,7 +48,7 @@
 | `nodePath` | `node` | 显式 node 可执行文件（默认走 PATH 发现）。 |
 | `toolTimeoutMs` | `30000` | 协作式工具调用超时（`exec.signal` 变为每次运行的 abort 源）。 |
 | `maxWallMs` | `600000` | 每次运行的墙钟预算；中断按 SIGINT→SIGTERM→SIGKILL 升级。 |
-| `maxOutputBytes` | `67108864` | 日志、完成值与失败消息合并后的字节上限（触发 `'output-limit'`）。 |
+| `maxOutputBytes` | `67108864` | 日志、完成值与失败消息合并后的字节上限（触发 `'output-limit'`）。若 host 捕获上限先溢出，spill 只能保存已保留前缀，并明确说明尾部不可恢复。 |
 | `maxOutputLineChars` | `4096` | 单行输出上限（字符）：更长行以 `…` 截断，防止一条日志炸弹独占预算。 |
 | `sessionIdleMs` | `0` | 空闲超过该毫秒数的会话被回收（`0` 禁用；状态丢失是显式代价）。 |
 | `interruptEscalationMs` | `5000` | SIGINT 后等待再发 SIGTERM，再等同样时长发 SIGKILL。 |
@@ -54,10 +58,10 @@
 | `snapshotDir` | `~/.dsh/code-runtime-kernels/state` | 快照根目录；文件位于 `<language>/<session-id-hash>.snapshot`。 |
 | `snapshotMaxBytes` | `134217728` | 单个快照文件的合并字节上限；超出的条目按名跳过。 |
 | `snapshotMaxEntryBytes` | `8388608` | 单条字节上限；超出的条目按名跳过。 |
-| `preload` | `{}` | 会话“工具箱”：`{ python?: string; typescript?: string }`，在每个新会话 kernel 上先作为隐藏首 cell 运行（快照恢复之前；同名恢复值会遮蔽助手）。preload 失败则本次运行报错。 |
+| `preload` | `{}` | 会话“工具箱”：`{ python?: string; typescript?: string }`，在每个新会话 kernel 上以触发调用的 cwd 与环境作为隐藏首 cell 运行，再恢复快照。preload 失败则本次运行报错。 |
 | `pythonImpl` | `'stdlib'` | Python 执行语义：`stdlib`（自包含 runner）或 `ipykernel`（真实 IPython shell：魔法命令、`!cmd`、display——`pythonPath` 指向的解释器需装有 IPython，否则启动即报错）。 |
 | `sandboxConfinement` | `false` | 将 kernel 子进程经沙箱接缝启动（结构式 `confine` 能力，见 `@deepseek-ai/dsh-sandbox` 的 `SandboxProvider`）而非直接 spawn。 |
-| `sandboxProvider` | — | 约束能力；`sandboxConfinement: true` 时必须提供（fail closed）。 |
+| `sandboxProvider` | — | 约束能力；`sandboxConfinement: true` 时必须提供（fail closed）。策略接收所属 DSH 会话 id，绝不接收模型选择的 kernel 子会话 id。 |
 | `sandboxWorkspaceRoot` | `process.cwd()` | `workspace-write` 模式下的可写根目录。 |
 | `sandboxMode` | `'workspace-write'` | 被约束 kernel 的文件效应模式（`'read-only'` 或 `'workspace-write'`）。 |
 
@@ -96,10 +100,13 @@ runner 不自带 Python——它 spawn `pythonPath` 指向的解释器。要用
 
 - **会话**。带非空 `session` 的调用运行于该会话的 kernel；`executionCount` 报告累计次数。`reset: true` 先关旧 kernel 再开新 kernel 响应。
 - **一次性**。没有 `session` 时，spawn 一个新 kernel，恰好运行一个程序后关闭。
+- **工作目录**。每次工具调用都解析会话当前工作目录；解析失败即令调用失败。新 kernel 的 preload 与用户 cell 使用同一目录。
+- **子进程环境**。kernel 使用 DSH 统一的凭据安全父环境清除策略，再加入显式 runner 控制项；环境中的凭据型变量与 `DSH_*` 不会进入模型代码。
 - **持久化**。Python：模块级变量与循环状态跨 cell 保留。JavaScript：`state`（长寿命共享对象）与 sloppy 全局赋值跨 cell 保留；cell 顶层的 `const`/`let`/`function`/`class` 是每 cell 作用域（async 函数体），持久定义请放 `state`。cell 以 `return <json>` 携带完成值，或以无 `return` 结束为无值运行；非 lossless JSON 完成值（环、`BigInt`、集合）判为 `'invalid-output'`。
+- **JavaScript 导入**。动态导入从调用工作目录使用 Node 原生 ESM loader，支持 `exports` import 条件、package `imports`、import attributes 与绝对文件路径。
 - **快照**。每次成功运行后保存命名空间（Python：`pickle` + `marshal` 字节码，逐名报告丢失；JavaScript：V8 二进制序列化，`Map`/`Set`/`Date`/环可保留，函数值键按名判丢）。该会话的新 kernel 只恢复一次最近快照——恢复运行日志中带 `[dsh-kernels] restored N names from snapshot (could not restore: …)`。`reset: true` 先删除快照，杜绝回魂。Python 字节码依赖 `marshal` 格式：跨 Python 小版本升级恢复时函数/类条目可能报丢（指名），数据不受影响。
 - **工具箱**。配置 `preload` 后，每个新会话 kernel 会先把该语言的源码作为隐藏首 cell 运行（先于快照恢复）：助手与普通会话状态一样参与快照，同名恢复值遮蔽同名助手。其输出对模型隐藏；preload 失败则本次运行报错。
-- **预算与失败种类**。墙钟超时 → `'timeout'`；取消或被迫终止 → `'abort'`；抛异常 → `'exception'`；非 JSON 完成 → `'invalid-output'`；合并输出溢出 → `'output-limit'`；kernel 死亡 → 会话注册表替换 kernel 并重试一次。全部是结果字段，绝不会 reject 工具调用。
+- **预算与失败种类**。墙钟超时 → `'timeout'`；取消或被迫终止 → `'abort'`；抛异常 → `'exception'`；非 JSON 完成 → `'invalid-output'`；合并输出溢出 → `'output-limit'`；kernel 自发死亡 → `'worker-exit'`。死亡 kernel 会被退役，但失败 cell 不会重放；下一次调用启动新 kernel。全部是结果字段，绝不会 reject 工具调用。
 
 ## 模型体验
 
@@ -108,6 +115,7 @@ runner 不自带 Python——它 spawn `pythonPath` 指向的解释器。要用
 ## 已知限制
 
 - **同步忙循环抗拒 SIGINT**。`while (true) {}` / `while True:` 永不交还事件循环，中断处理器无法运行，实际由升级梯（SIGTERM 再 SIGKILL）终止——代价是会话状态与 kernel。会让出事件循环的 cell（对定时器/IO/工具调用的 `await`）可被干净取消，kernel 存活（墙钟/中止测试即覆盖这一分界）。
+- **捕获截断不可逆**。单个 kernel 帧越过 host 捕获上限时，结果与 spill 元数据会把保存内容标为已保留前缀，不会声称被丢弃尾部可恢复。
 - **状态可能被污染**。错误程序随时可能弄坏会话状态；`reset: true` 是设计的恢复原语（同时删除快照，污染不会复活）。
 - **无安全边界**。kernel 代码拥有与内置 process 后端相同的 bash 级信任——快照文件同理（`pickle`/`marshal` 不可用于不可信输入）；请保持 `snapshotDir` 为用户私有。
 - **快照按名粒度**。Python：数据、模块、可导入调用及 `__main__` 内定义的函数/类按值保存；用户类实例、含不可 pickle 闭包者、超限条目在下次恢复时点名报告。JavaScript：`state` 与 sloppy 全局赋值按键保存；键值内任意位置出现函数即丢弃整键（点名）。

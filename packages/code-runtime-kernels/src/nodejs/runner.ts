@@ -47,13 +47,21 @@ interface ReplyMessage {
   message?: string
   name?: string
 }
-import { createRequire, isBuiltin, stripTypeScriptTypes } from 'node:module'
+import { registerHooks, stripTypeScriptTypes } from 'node:module'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { dirname, isAbsolute, join } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { format } from 'node:util'
 import { deserialize, serialize } from 'node:v8'
-import { compileFunction, type CompileFunctionOptions } from 'node:vm'
+import { compileFunction, constants } from 'node:vm'
+
+// Node's ESM loader rejects Windows drive paths as URL schemes. The dedicated
+// runner normalizes absolute filesystem specifiers before native resolution.
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    return nextResolve(isAbsolute(specifier) ? pathToFileURL(specifier).href : specifier, context)
+  },
+})
 
 /** Global-object accessor for program-scope globals keyed by identifier. */
 const g: Record<string, unknown> = globalThis
@@ -373,19 +381,6 @@ function restoreGlobals(run: ActiveRun): void {
 const INTERRUPTED = new Error('run interrupted by SIGINT')
 INTERRUPTED.name = 'INTERRUPTED'
 
-/**
- * Deliberate dynamic-import resolution for `await import(...)` inside a cell:
- * builtins (with or without the `node:` prefix) and any scheme'd specifier
- * (`data:`, `https:`, …) pass straight through to import(); relative and bare
- * package specifiers resolve against the run's working directory
- * (process.cwd() follows the per-run cwd), not the runner's staging location.
- */
-async function importDynamic(specifier: string): Promise<unknown> {
-  if (isBuiltin(specifier) || /^[a-zA-Z][a-zA-Z0-9+.-]*:/.test(specifier)) return import(specifier)
-  const require = createRequire(join(process.cwd(), 'dsh-kernel-cell.js'))
-  const resolved = require.resolve(specifier, { paths: [process.cwd()] })
-  return import(pathToFileURL(resolved).href)
-}
 
 /** Run one cell; RETURN its done frame (the caller attaches persistence and emits). */
 async function runCell(code: string, run: ActiveRun, namespaces: ExecNamespaceDescriptor[]): Promise<Record<string, unknown>> {
@@ -407,17 +402,13 @@ async function runCell(code: string, run: ActiveRun, namespaces: ExecNamespaceDe
     // cell is wrapped as a module-level EXPRESSION first and the compiled body
     // becomes `return <expr>;` — the same function-body semantics as before.
     const prepared = stripTypeScriptTypes('(async () => {\n' + code + '\n})()', { mode: 'strip' })
-    // `compileFunction` is V8's Function-constructor path without the implied-eval
-    // surface: the same function-body semantics (including a `this` bound at
-    // call time), compilable up front so a syntax error settles the run. The
-    // import callback makes `await import(...)` deliberate instead of a hard
-    // error; the kernel process runs with --experimental-vm-modules so the
-    // callback is honored. (The cast: @types/node narrows the loader's return
-    // to vm.Module/CJS Module, but Node itself also accepts a real namespace
-    // object, which is exactly what the passthrough import returns.)
+    // The main-context ESM loader preserves native import semantics. Setting
+    // the synthetic filename to the run cwd makes relative and bare package
+    // specifiers resolve from the user's project rather than the staged runner.
     const compileOptions = {
-      importModuleDynamically: (specifier: string): Promise<unknown> => importDynamic(specifier),
-    } as unknown as CompileFunctionOptions
+      filename: join(process.cwd(), 'dsh-kernel-cell.js'),
+      importModuleDynamically: constants.USE_MAIN_CONTEXT_DEFAULT_LOADER,
+    }
     program = compileFunction('return ' + prepared, [], compileOptions) as (...args: unknown[]) => unknown
   } catch (error: unknown) {
     const message = messageOf(error)

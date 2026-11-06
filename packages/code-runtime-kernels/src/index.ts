@@ -16,6 +16,8 @@ import { homedir } from 'node:os'
 import { join, resolve, sep } from 'node:path'
 import { inspect } from 'node:util'
 import { Context } from '@deepseek-ai/cordis'
+import type { SessionId } from '@deepseek-ai/dsh-session'
+import { scrubbedParentEnv } from '@deepseek-ai/dsh-subprocess'
 import type { SaveTextSpill } from '@deepseek-ai/dsh-spill'
 import z from '@deepseek-ai/schemastery'
 import {
@@ -101,9 +103,8 @@ export interface Config {
   snapshotMaxEntryBytes?: number
   /**
    * Session "toolbox": one preload source per language. It runs as a hidden
-   * first cell of every fresh session kernel (before the snapshot restore,
-   * so restored names shadow same-named helpers; user state wins). A preload
-   * failure fails the triggering run like an exception.
+   * first cell of every fresh session kernel with the triggering call's cwd
+   * and environment, before snapshot restore. A failure fails that run.
    */
   preload?: { python?: string; typescript?: string }
   /** Confine kernel subprocesses through the sandbox seam (default false = unconfined). */
@@ -186,6 +187,11 @@ export interface KernelRunRequest {
   code: string
   /** Optional persistent-kernel identity: runs sharing one keep kernel state. */
   sessionId?: string
+  /**
+   * Owning DSH session for sandbox policy. This is distinct from the
+   * model-chosen persistent-kernel id in {@link sessionId}.
+   */
+  sandboxSessionId?: SessionId
   /** Discard the session's prior kernel state before this run. */
   reset?: boolean
   /** Abort the run host-side; in-flight binding calls are the caller's to settle. */
@@ -244,74 +250,72 @@ class OutputLedger {
     return logs.map(text => text.split('\n').map(line => this.clipLine(line)).join('\n'))
   }
 
-  /** Finalize a successful absent-or-JSON completion against the COMBINED cap: logs + value together. */
+  /** Finalize a successful absent-or-JSON completion against the combined cap. */
   success(logs: string[], value?: PtcJsonValue): PtcRunResult {
     const clipped = this.clipLogs(logs)
     if (value === undefined) {
-      if (this.logBytes(clipped) > this.maxBytes) return this.fit(clipped)
+      if (this.logBytes(clipped) > this.maxBytes) return this.outputLimit(clipped)
       return { logs: clipped }
     }
     const valueBytes = this.compactJsonBytes(value)
-    // A completion value that cannot serialize (or alone exceeds the cap) is
-    // an overflow; otherwise the LOG bytes count against the value too — a
-    // log bomb may no longer ride in under a value-only check.
-    if (valueBytes === undefined || valueBytes > this.maxBytes) return this.fit(clipped)
+    if (valueBytes === undefined || valueBytes > this.maxBytes) return this.outputLimit(clipped)
     if (this.logBytes(clipped) + valueBytes <= this.maxBytes) return { logs: clipped, value }
-    return this.fit(clipped, { value })
+    return this.outputLimit(clipped)
   }
 
   /**
-   * Finalize a failure diagnostic against the combined cap. The diagnostic
-   * outranks the logs: it is kept (clipped to the budget when monstrous) and
-   * logs are fitted around it, so the failure reason always reaches the model
-   * even when the program also log-bombed.
+   * Finalize a failure diagnostic against the combined cap. A diagnostic that
+   * fits outranks logs; any combined overflow becomes `output-limit`.
    */
   failure(logs: string[], error: PtcRunFailure): PtcRunResult {
     const clipped = this.clipLogs(logs)
-    const message = this.clipText(error.message, Math.max(MIN_OUTPUT_BYTES, this.maxBytes - 1024))
-    const fixed = this.textBytes(`${error.kind}: ${message}`) + 2
-    if (fixed + this.logBytes(clipped) <= this.maxBytes) return { logs: clipped, error: { ...error, message } }
-    return this.fit(clipped, { error: { ...error, message } })
+    const message = this.clipText(error.message, Math.max(0, this.maxBytes - 2))
+    if (this.textBytes(message) + this.logBytes(clipped) <= this.maxBytes) {
+      return { logs: clipped, error: { ...error, message } }
+    }
+    return this.outputLimit(clipped)
   }
 
-  /** UTF-8 byte total of a clipped logs array (JSON brackets + per-entry separators). */
+  /** Build an output-limit result while retaining as many leading logs as fit. */
+  outputLimit(logs: string[]): PtcRunResult {
+    const message = this.clipText(`outer output exceeded ${this.maxBytes} bytes`, Math.max(0, this.maxBytes - 2))
+    return this.fit(this.clipLogs(logs), { kind: 'output-limit', message })
+  }
+
+  /** UTF-8 byte total of a clipped logs array using its compact JSON encoding. */
   private logBytes(logs: string[]): number {
-    let total = 2
-    for (const text of logs) total += this.textBytes(text) + 1
-    return total
+    return this.textBytes(JSON.stringify(logs))
   }
 
-  /**
-   * Build the output-limit failure: mandatory payload first (a completion
-   * value that fit alone, or the original failure kind/message), then as many
-   * log entries as the remaining budget admits.
-   */
-  private fit(logs: string[], mandatory: { value?: PtcJsonValue; error?: PtcRunFailure } = {}): PtcRunResult {
-    const fullMessage = `outer output exceeded ${this.maxBytes} bytes`
-    const error = mandatory.error ?? { kind: 'output-limit' as const, message: fullMessage }
-    // (No bracket reserve here: retainedBytes below already carries it.)
-    let fixedBytes = this.textBytes(`${error.kind}: ${error.message}`)
-    if (mandatory.value !== undefined) fixedBytes += this.compactJsonBytes(mandatory.value) ?? 0
+  /** Keep the mandatory diagnostic, then admit leading log entries that fit. */
+  private fit(logs: string[], error: PtcRunFailure): PtcRunResult {
+    const fixedBytes = this.textBytes(error.message)
     const retained: string[] = []
     let retainedBytes = 2
     for (const text of logs) {
       const separatorBytes = retained.length > 0 ? 1 : 0
-      if (fixedBytes + retainedBytes + this.textBytes(text) + separatorBytes > this.maxBytes) break
+      const entryBytes = this.textBytes(JSON.stringify(text))
+      if (fixedBytes + retainedBytes + separatorBytes + entryBytes > this.maxBytes) break
       retained.push(text)
-      retainedBytes += this.textBytes(text) + separatorBytes
+      retainedBytes += separatorBytes + entryBytes
     }
-    return {
-      logs: retained,
-      ...mandatory.value !== undefined ? { value: mandatory.value } : {},
-      error,
-    }
+    return { logs: retained, error }
   }
 
   /** Byte-budget clip for a single text (diagnostics), with a `…` marker. */
   private clipText(text: string, maxBytes: number): string {
     if (this.textBytes(text) <= maxBytes) return text
-    const clipped = Buffer.from(text, 'utf8').subarray(0, Math.max(1, maxBytes - 1)).toString('utf8')
-    return `${clipped}…`
+    const marker = '…'
+    const markerBytes = this.textBytes(marker)
+    if (maxBytes < markerBytes) return ''
+    const source = Buffer.from(text, 'utf8')
+    let end = Math.max(0, maxBytes - markerBytes)
+    let clipped = source.subarray(0, end).toString('utf8')
+    while (end > 0 && this.textBytes(clipped) + markerBytes > maxBytes) {
+      end -= 1
+      clipped = source.subarray(0, end).toString('utf8')
+    }
+    return `${clipped}${marker}`
   }
 
   private compactJsonBytes(value: PtcJsonValue): number | undefined {
@@ -326,21 +330,11 @@ class OutputLedger {
 }
 
 /**
- * Base environment handed to a kernel process: the parent env with all
- * `DSH_*` variables stripped. Kernel workers are model-facing compute
- * surfaces, not harness infrastructure — they must not inherit harness
- * state (auth tokens, debug endpoints, tool wiring). Deliberate
- * `DSH_KERNEL_*` runner control env is merged after this scrub inside
- * `KernelHost.start`, so it still reaches the runner.
+ * Metadata accompanying an output-limit spill. `complete` is false when the
+ * host-side capture cap discarded a tail before finalization.
  */
-function scrubKernelEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
-  const scrubbed: NodeJS.ProcessEnv = {}
-  for (const [key, value] of Object.entries(env)) {
-    if (value === undefined) continue
-    if (/^dsh_/i.test(key)) continue
-    scrubbed[key] = value
-  }
-  return scrubbed
+export interface OutputLimitInfo {
+  complete: boolean
 }
 /**
  * Owns the two persistent kernel registries and maps one `KernelRunRequest`
@@ -354,12 +348,15 @@ export class KernelManager {
   readonly #registries = new Map<'python' | 'typescript', SessionRegistry>()
   readonly #ledgerFactory: () => OutputLedger
   /** Async confinement seam (matches the real sandbox provider; see kernel.ts). */
-  readonly #confine: ((argv: readonly string[], signal?: AbortSignal, sessionId?: string) => Promise<{ argv: string[] }>) | undefined
+  readonly #confine: ((argv: readonly string[], signal?: AbortSignal, sessionId?: SessionId) => Promise<{ argv: string[] }>) | undefined
   /** In-flight one-shot kernels: every admitted run is tracked so teardown quiesces them too. */
   readonly #oneshots = new Set<Promise<unknown>>()
+  /** Every admitted run's abort source; teardown aborts the set before draining it. */
+  readonly #runControllers = new Set<AbortController>()
   /** Python commands whose probe already passed this manager's lifetime; failures are never cached. */
   readonly #verifiedPython = new Set<string>()
   #disposed = false
+  #teardownPromise: Promise<void> | undefined
 
   constructor(config: Config) {
     // Fill defaults here too: the plugin path gets them from the schemastery
@@ -438,9 +435,8 @@ export class KernelManager {
     if (resolved.sandboxConfinement && resolved.sandboxProvider !== undefined) {
       const provider = resolved.sandboxProvider
       const root = resolve(resolved.sandboxWorkspaceRoot)
-      // The real sandbox seam is async and fail-closed (see KernelStartConfig);
-      // a rejection surfaces as a structured kernel-start failure. sessionId
-      // scopes the policy to the owning session (per-session ACL grants).
+      // The real sandbox seam is async and fail-closed (see KernelStartConfig).
+      // The DSH session id owns sandbox policy; kernel sub-session ids do not.
       this.#confine = (argv, signal, sessionId) => provider.confine(argv, {
         mode: resolved.sandboxMode,
         workspaceRoot: root,
@@ -452,7 +448,7 @@ export class KernelManager {
     for (const language of resolved.languages) {
       this.#registries.set(language, new SessionRegistry({
         label: language === 'python' ? 'python kernel' : 'nodejs kernel',
-        start: (signal, sessionId) => this.#startKernel(language === 'python' ? 'python' : 'typescript', signal, sessionId),
+        start: (signal, sandboxSessionId) => this.#startKernel(language === 'python' ? 'python' : 'typescript', signal, sandboxSessionId),
         sessionIdleMs: resolved.sessionIdleMs,
         // The JavaScript runner's cancellation leaves the abandoned cell
         // evaluating as a ghost inside the kernel, so an aborted JS run
@@ -481,14 +477,17 @@ export class KernelManager {
     }
   }
 
-  /**
-   * Terminate every kernel to quiescence (plugin teardown): session registries
-   * first, then every in-flight one-shot (each shuts its own kernel down in
-   * its finally). Unloading awaits the returned promise, so disposal no longer
-   * returns while kernels are still alive.
-   */
-  async teardown(): Promise<void> {
+  /** Abort admitted work, then terminate every session and one-shot kernel. */
+  teardown(): Promise<void> {
+    this.#teardownPromise ??= this.#drain()
+    return this.#teardownPromise
+  }
+
+  async #drain(): Promise<void> {
     this.#disposed = true
+    for (const controller of this.#runControllers) {
+      controller.abort(new Error('dsh-code-runtime-kernels: plugin teardown'))
+    }
     await Promise.allSettled([...this.#registries.values()].map(registry => registry.disposeAll()))
     await Promise.allSettled([...this.#oneshots])
   }
@@ -508,18 +507,12 @@ export class KernelManager {
    * `sessionId` the program runs in that session's persistent kernel and
    * `executionCount` is reported; `reset: true` discards prior state first.
    *
-   * `onOutputLimit` is a best-effort spill hook called only when the run's
-   * output crosses `maxOutputBytes`: it receives the FULL captured program
-   * output (the same bytes that just overflowed the result budget) and may
-   * persist them somewhere recoverable. Returning a retrieval hint rewrites
-   * the `output-limit` message so the caller can recover the dropped tail;
-   * returning `undefined` (no backend, no owner, storage failure) keeps the
-   * truncated result untouched. The manager never awaits this beyond a
-   * best-effort `catch` — spill failure cannot fail the program.
+   * `onOutputLimit` keeps its original content-first callback and receives
+   * additive metadata describing whether host capture retained the full text.
    */
   async run(
     request: KernelRunRequest,
-    onOutputLimit?: (content: string) => Promise<string | undefined>,
+    onOutputLimit?: (content: string, info: OutputLimitInfo) => Promise<string | undefined>,
   ): Promise<KernelRunResult> {
     if (this.#disposed) throw new Error('dsh-code-runtime-kernels: run() after disposal')
     const registry = this.#registries.get(request.language)
@@ -531,9 +524,8 @@ export class KernelManager {
       return this.#ledgerFactory().failure([], { kind: 'abort', message: String(request.signal.reason) })
     }
 
-    // Wall-clock budget: this run's abort source. The kernel turns it into
-    // SIGINT (and escalation), so a busy cell is interrupted hard.
     const controller = new AbortController()
+    this.#runControllers.add(controller)
     let timedOut = false
     const timer = setTimeout(() => {
       timedOut = true
@@ -549,23 +541,42 @@ export class KernelManager {
         ? await registry.executeOnSession(sessionId, request.code, bindings, {
           ...request.reset !== undefined ? { reset: request.reset } : {},
           ...request.cwd !== undefined ? { cwd: request.cwd } : {},
+          ...request.sandboxSessionId !== undefined ? { sandboxSessionId: request.sandboxSessionId } : {},
           signal: controller.signal,
         })
-        : await this.#runOneShot(request.language, request.code, bindings, controller.signal, request.cwd)
+        : await this.#runOneShot(
+          request.language,
+          request.code,
+          bindings,
+          controller.signal,
+          request.cwd,
+          request.sandboxSessionId,
+        )
       return await this.finalize(outcome, timedOut, onOutputLimit)
+    } catch (error: unknown) {
+      if (!controller.signal.aborted) throw error
+      return await this.finalize({
+        status: 'error',
+        logs: [],
+        cancelled: true,
+        invalidOutput: false,
+        message: String(controller.signal.reason ?? error),
+        killed: false,
+      }, timedOut, onOutputLimit)
     } finally {
       clearTimeout(timer)
       request.signal?.removeEventListener('abort', onOuter)
+      this.#runControllers.delete(controller)
     }
   }
 
-  #startKernel(language: 'python' | 'typescript', signal?: AbortSignal, sessionId?: string): Promise<KernelHost> {
+  #startKernel(language: 'python' | 'typescript', signal?: AbortSignal, sandboxSessionId?: SessionId): Promise<KernelHost> {
     return language === 'python'
-      ? this.#startPython(signal, sessionId)
-      : this.#startNodejs(signal, sessionId)
+      ? this.#startPython(signal, sandboxSessionId)
+      : this.#startNodejs(signal, sandboxSessionId)
   }
 
-  async #startPython(signal?: AbortSignal, sessionId?: string): Promise<KernelHost> {
+  async #startPython(signal?: AbortSignal, sandboxSessionId?: SessionId): Promise<KernelHost> {
     const command = await this.#resolvePythonCommand()
     const profile = {
       key: 'python' as const,
@@ -584,7 +595,7 @@ export class KernelManager {
       idPrefix: 'py-',
       label: 'python kernel',
     }
-    return KernelHost.start(profile, this.#startConfig(signal, sessionId))
+    return KernelHost.start(profile, this.#startConfig(signal, sandboxSessionId))
   }
 
   /** Resolve the python command for a kernel start (config.pythonPath first, then PATH candidates). */
@@ -595,28 +606,24 @@ export class KernelManager {
     })
   }
 
-  #startNodejs(signal?: AbortSignal, sessionId?: string): Promise<KernelHost> {
+  #startNodejs(signal?: AbortSignal, sandboxSessionId?: SessionId): Promise<KernelHost> {
     return KernelHost.start(
       nodejsKernelProfile(this.#config.nodePath ?? 'node'),
-      this.#startConfig(signal, sessionId),
+      this.#startConfig(signal, sandboxSessionId),
     )
   }
 
-  #startConfig(signal?: AbortSignal, sessionId?: string) {
+  #startConfig(signal?: AbortSignal, sandboxSessionId?: SessionId) {
     return {
       cwd: process.cwd(),
-      // The kernel must not see harness-internal state: DSH_* variables are
-      // scrubbed from the base env (deliberate runner env like DSH_KERNEL_CWD
-      // is merged after the scrub inside KernelHost.start, so it survives).
-      env: scrubKernelEnv(process.env),
+      // DSH owns the credential-safe parent environment policy. Deliberate
+      // runner controls are merged from the profile after this scrub.
+      env: scrubbedParentEnv(),
       startupTimeoutMs: this.#config.startupTimeoutMs,
       interruptEscalationMs: this.#config.interruptEscalationMs,
       shutdownGraceMs: this.#config.shutdownGraceMs,
-      // The triggering run's abort signal: an aborted caller cancels the
-      // confine await instead of stalling kernel start indefinitely.
       ...signal !== undefined ? { signal } : {},
-      // Owning session id, when the run has one (per-session sandbox policy).
-      ...sessionId !== undefined ? { sessionId } : {},
+      ...sandboxSessionId !== undefined ? { sandboxSessionId } : {},
       // Host-side per-run capture cap: the kernel log ring is bounded by the
       // same byte budget as the result envelope, so a log bomb cannot balloon
       // host memory before the ledger clips the result.
@@ -632,10 +639,10 @@ export class KernelManager {
     bindings: PtcBindingNamespace[],
     signal: AbortSignal,
     cwd?: string,
+    sandboxSessionId?: SessionId,
   ): Promise<KernelExecResult> {
-    const run = this.#oneShotRun(language, code, bindings, signal, cwd)
-    // Track the admitted run so teardown() quiesces kernels that were started
-    // for one-shot programs (an unawaited start would outlive disposal).
+    const run = this.#oneShotRun(language, code, bindings, signal, cwd, sandboxSessionId)
+    // Track the admitted run so teardown() quiesces its kernel.
     this.#oneshots.add(run)
     try {
       return await run
@@ -650,8 +657,9 @@ export class KernelManager {
     bindings: PtcBindingNamespace[],
     signal: AbortSignal,
     cwd?: string,
+    sandboxSessionId?: SessionId,
   ): Promise<KernelExecResult> {
-    const kernel = await this.#startKernel(language, signal)
+    const kernel = await this.#startKernel(language, signal, sandboxSessionId)
     try {
       return await kernel.execute(randomUUID(), code, bindings, {
         signal,
@@ -665,90 +673,74 @@ export class KernelManager {
   }
 
   /**
-   * Map a kernel outcome onto the failure taxonomy through the output ledger.
-   * Budget expiry owns a run that hit the wall clock (whether or not the
-   * kernel survived to acknowledge it); everything else interrupted is an
-   * abort; a died kernel is an abort unless the budget already owns the run.
-   */
-  /**
-   * Map a kernel outcome onto the failure taxonomy through the output ledger.
-   * Budget expiry owns a run that hit the wall clock (whether or not the
-   * kernel survived to acknowledge it); a kernel that died without
-   * host-initiated termination is a `worker-exit` — the run is NOT retried,
-   * and the warning names the external-effects risk. Everything else
-   * interrupted is an abort.
-   *
-   * An `output-limit` outcome additionally consults `onOutputLimit` to spill
-   * the full captured output, best-effort (never awaited past a catch).
+   * Map one kernel outcome onto the PTC failure taxonomy. Capture truncation
+   * takes precedence because the discarded tail prevents a complete result.
    */
   private async finalize(
     outcome: KernelExecResult,
     timedOut: boolean,
-    onOutputLimit?: (content: string) => Promise<string | undefined>,
+    onOutputLimit?: (content: string, info: OutputLimitInfo) => Promise<string | undefined>,
   ): Promise<KernelRunResult> {
     const ledger = this.#ledgerFactory()
     const logs = outcome.logs.map(entry => entry.text)
-    if (timedOut) {
-      const message = outcome.killed
+    let spillDiagnostic: string | undefined
+    let result: PtcRunResult
+    if (outcome.captureTruncated === true) {
+      result = ledger.outputLimit(logs)
+    } else if (timedOut) {
+      spillDiagnostic = outcome.killed
         ? `wall-clock ceiling reached (${this.#config.maxWallMs}ms); kernel killed after unresponsive interrupt`
         : `wall-clock ceiling reached (${this.#config.maxWallMs}ms)`
-      return ledger.failure(logs, { kind: 'timeout', message })
-    }
-    // A spontaneously dead worker (exit, OOM, kill -9 from outside): never
-    // classified as a plain abort, and never retried by the registry — the
-    // warning tells the model its code may have partially applied external
-    // effects before the process died.
-    if (outcome.crashed === true && !outcome.cancelled) {
-      return ledger.failure(logs, {
-        kind: 'worker-exit',
-        message: `${outcome.message || 'the kernel worker exited before completing this run'}; the kernel was retired and this run was NOT retried — external effects (file writes, network calls) it completed before exiting remain`,
+      result = ledger.failure(logs, { kind: 'timeout', message: spillDiagnostic })
+    } else if (outcome.crashed === true && !outcome.cancelled) {
+      spillDiagnostic = `${outcome.message || 'the kernel worker exited before completing this run'}; the kernel was retired and this run was NOT retried — external effects (file writes, network calls) it completed before exiting remain`
+      result = ledger.failure(logs, { kind: 'worker-exit', message: spillDiagnostic })
+    } else if (outcome.killed || outcome.cancelled) {
+      spillDiagnostic = outcome.message || 'run interrupted'
+      result = ledger.failure(logs, { kind: 'abort', message: spillDiagnostic })
+    } else if (outcome.status === 'error') {
+      spillDiagnostic = outcome.message || (outcome.invalidOutput
+        ? 'program completion must be lossless JSON'
+        : 'program failed')
+      result = ledger.failure(logs, {
+        kind: outcome.invalidOutput ? 'invalid-output' : 'exception',
+        message: spillDiagnostic,
       })
+    } else {
+      result = outcome.value === undefined
+        ? ledger.success(logs)
+        : ledger.success(logs, outcome.value)
     }
-    if (outcome.killed) {
-      return ledger.failure(logs, { kind: 'abort', message: outcome.message || 'run interrupted' })
-    }
-    if (outcome.cancelled) {
-      return ledger.failure(logs, { kind: 'abort', message: outcome.message || 'run interrupted' })
-    }
-    if (outcome.status === 'error') {
-      if (outcome.invalidOutput) {
-        return ledger.failure(logs, { kind: 'invalid-output', message: outcome.message || 'program completion must be lossless JSON' })
-      }
-      return ledger.failure(logs, { kind: 'exception', message: outcome.message || 'program failed' })
-    }
-    const result = outcome.value === undefined
-      ? ledger.success(logs)
-      : ledger.success(logs, outcome.value)
     const settled: KernelRunResult = {
       ...result,
       ...outcome.executionCount !== undefined ? { executionCount: outcome.executionCount } : {},
       ...outcome.persistence !== undefined ? { persistence: outcome.persistence } : {},
     }
-    if (settled.error?.kind === 'output-limit' && onOutputLimit !== undefined) {
-      // The overflow was either captured logs or (for a clean run) a
-      // completion value too large to survive the JSON serialization budget —
-      // spill whatever full text we still hold so the caller can recover it.
-      let valueText: string | undefined
-      if (outcome.value !== undefined) {
-        try {
-          valueText = JSON.stringify(outcome.value)
-        } catch {
-          // JSON.stringify rejected the value (circular reference, exotic
-          // object); a structural inspection is the best text we still have.
-          valueText = inspect(outcome.value, { depth: 8, maxArrayLength: 200, breakLength: 100 })
-        }
-      }
-      const spillContent = valueText === undefined
-        ? logs.join('\n')
-        : `${logs.join('\n')}\n[completion value]\n${valueText}`
+    if (settled.error?.kind !== 'output-limit' || onOutputLimit === undefined) return settled
+
+    let valueText: string | undefined
+    if (outcome.value !== undefined) {
       try {
-        const hint = await onOutputLimit(spillContent)
-        if (hint !== undefined && hint.length > 0) {
-          return { ...settled, error: { ...settled.error, message: `${settled.error.message} — full program output preserved at ${hint}` } }
-        }
+        valueText = JSON.stringify(outcome.value)
       } catch {
-        // Best-effort by contract: a spill failure keeps the truncated result.
+        valueText = inspect(outcome.value, { depth: 8, maxArrayLength: 200, breakLength: 100 })
       }
+    }
+    const parts = [logs.join('\n')]
+    if (valueText !== undefined) parts.push(`[completion value]\n${valueText}`)
+    if (spillDiagnostic !== undefined) parts.push(`[program failure]\n${spillDiagnostic}`)
+    const content = parts.filter(part => part.length > 0).join('\n')
+    const info: OutputLimitInfo = { complete: outcome.captureTruncated !== true }
+    try {
+      const hint = await onOutputLimit(content, info)
+      if (hint !== undefined && hint.length > 0) {
+        const preserved = info.complete
+          ? `full program output preserved at ${hint}`
+          : `captured output prefix preserved at ${hint}; discarded tail unavailable`
+        return { ...settled, error: { ...settled.error, message: `${settled.error.message} — ${preserved}` } }
+      }
+    } catch {
+      // Best effort: spill storage cannot change the program outcome.
     }
     return settled
   }
@@ -1001,18 +993,17 @@ export function apply(ctx: Context, config: Config): void {
       presentationMeta: (_args, value) => runKernelCodeMeta(value as RunKernelCodeValue),
     },
     async execute(args: RunKernelCodeArgs, exec) {
-      // Best-effort recovery for output overruns: persist the full captured
-      // output through ctx.spillStore so an oversized dataframe dump survives
-      // the result budget. No store, no session owner, or a storage failure
-      // leaves the truncated `output-limit` result intact.
+      // Best-effort recovery for output overruns. Capture truncation is
+      // labeled as a prefix so the spill never claims a discarded tail exists.
       const dshSessionId = exec.agent?.session.header.id
       const spillStore = ctx.get('spillStore')
-      const onOutputLimit = async (content: string): Promise<string | undefined> => {
+      const onOutputLimit = async (content: string, info: OutputLimitInfo): Promise<string | undefined> => {
         if (dshSessionId === undefined || spillStore === undefined) return undefined
+        const label = info.complete ? 'kernel-output' : 'kernel-output-prefix'
         const save: SaveTextSpill = {
           owner: { sessionId: dshSessionId },
-          source: { kind: 'tool', toolName: 'run_kernel_code', callId: exec.callId, label: 'kernel-output' },
-          suggestedName: 'kernel-output.txt',
+          source: { kind: 'tool', toolName: 'run_kernel_code', callId: exec.callId, label },
+          suggestedName: `${label}.txt`,
           content,
         }
         try {
@@ -1023,27 +1014,21 @@ export function apply(ctx: Context, config: Config): void {
         }
       }
 
-      // Session scoping: a model-chosen `session` id is namespaced by the
-      // harness conversation id, so two conversations that both pick "analysis"
-      // never share a kernel (or each other's snapshot files).
+      // A model-chosen id is namespaced by the DSH conversation id for kernel
+      // persistence. Sandbox ownership separately receives only the DSH id.
       const kernelSessionId = args.session !== undefined && args.session.length > 0
         ? `${dshSessionId ?? 'orphan-conversation'}:${args.session}`
         : undefined
 
-      // The kernel starts in the conversation's working directory when the
-      // optional working-directory service is mounted (the plugin degrades to
-      // the plugin host's cwd otherwise). Resolved per call, not cached: the
-      // conversation may legitimately move.
-      let initialDir: string | undefined
+      // Resolve per call because the conversation may move. A mounted service
+      // owns failures; absence falls back to the session header's cwd.
+      let initialDir = exec.agent?.session.header.cwd
       if (exec.agent !== undefined) {
-        try {
-          const workingDirectory = ctx.get('workingDirectory') as
-            | { ensure(agent: { readonly id: string }, signal?: AbortSignal): Promise<string> }
-            | undefined
-          initialDir = await workingDirectory?.ensure(exec.agent, exec.signal)
-        } catch {
-          // Optional service: absence, failure, or caller abort leaves the
-          // kernel in the default cwd.
+        const workingDirectory = ctx.get('workingDirectory') as
+          | { ensure(agent: { readonly id: string }, signal?: AbortSignal): Promise<string> }
+          | undefined
+        if (workingDirectory !== undefined) {
+          initialDir = await workingDirectory.ensure(exec.agent, exec.signal)
         }
       }
 
@@ -1051,6 +1036,7 @@ export function apply(ctx: Context, config: Config): void {
         language: args.language,
         code: args.code,
         ...kernelSessionId !== undefined ? { sessionId: kernelSessionId } : {},
+        ...dshSessionId !== undefined ? { sandboxSessionId: dshSessionId } : {},
         ...args.reset !== undefined ? { reset: args.reset } : {},
         ...initialDir !== undefined ? { cwd: initialDir } : {},
         signal: exec.signal,

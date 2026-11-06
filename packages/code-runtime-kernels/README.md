@@ -36,6 +36,10 @@ Add the bundle row (or a similar row in any `cordis.yml`):
 
 All row ids carry the `hy-sde-` prefix so they never clash with shipped rows (a duplicate loader id fails the boot). Then the model sees the `run_kernel_code` tool.
 
+## Upgrading from 0.2.1-rc.5
+
+Standalone installations must satisfy the new `@deepseek-ai/dsh-subprocess` peer; supported DSH profiles already provide it. `KernelManager.run` keeps the output-limit callback's first `content` argument and adds an optional second `{ complete }` argument, so existing callbacks need no source change.
+
 ## Config
 
 | Key | Default | Meaning |
@@ -46,7 +50,7 @@ All row ids carry the `hy-sde-` prefix so they never clash with shipped rows (a 
 | `nodePath` | `node` | Explicit node executable (PATH discovery by default). |
 | `toolTimeoutMs` | `30000` | Cooperative tool-call timeout (`exec.signal` becomes the per-run abort). |
 | `maxWallMs` | `600000` | Per-run wall-clock budget; interrupt gradates SIGINT → SIGTERM → SIGKILL when the kernel does not respond. |
-| `maxOutputBytes` | `67108864` | Combined serialized log-, completion-, and failure-message byte cap (an `'output-limit'` failure). |
+| `maxOutputBytes` | `67108864` | Combined serialized log-, completion-, and failure-message byte cap (an `'output-limit'` failure). A host-capture overflow can spill only its retained prefix and says that the discarded tail is unavailable. |
 | `maxOutputLineChars` | `4096` | Per-line output cap (chars): a longer line is clipped with a `…` marker so one log bomb cannot own the budget. |
 | `sessionIdleMs` | `0` | Reap a session whose kernel sits unused for this long (`0` disables; state loss is the explicit cost). |
 | `interruptEscalationMs` | `5000` | Wait after SIGINT before SIGTERM, then the same again before SIGKILL. |
@@ -56,10 +60,10 @@ All row ids carry the `hy-sde-` prefix so they never clash with shipped rows (a 
 | `snapshotDir` | `~/.dsh/code-runtime-kernels/state` | Snapshot root; files live under `<language>/<session-id-hash>.snapshot`. |
 | `snapshotMaxBytes` | `134217728` | Combined byte cap for one snapshot file; entries past it are skipped by name. |
 | `snapshotMaxEntryBytes` | `8388608` | Per-entry byte cap; an entry larger than this is skipped and named. |
-| `preload` | `{}` | Session "toolbox": `{ python?: string; typescript?: string }` sources run as one hidden first cell of every fresh session kernel (before the snapshot restores, so a restored name shadows a same-named helper). A preload failure fails the triggering run like an exception. |
+| `preload` | `{}` | Session "toolbox": `{ python?: string; typescript?: string }` sources run as one hidden first cell of every fresh session kernel, with the triggering call's cwd and environment, before snapshot restore. A preload failure fails the triggering run like an exception. |
 | `pythonImpl` | `'stdlib'` | Python execution semantics: `stdlib` (self-contained runner) or `ipykernel` (a real IPython shell: magics, `!cmd`, display — the interpreter pointed at by `pythonPath` must have IPython installed; the kernel fails loud at boot otherwise). |
 | `sandboxConfinement` | `false` | Route kernel subprocess spawns through the sandbox seam (structural `confine` capability, see `SandboxProvider` in `@deepseek-ai/dsh-sandbox`) instead of `spawn`ing the interpreter directly. |
-| `sandboxProvider` | — | The confinement capability; required when `sandboxConfinement` is `true` (fail closed). |
+| `sandboxProvider` | — | The confinement capability; required when `sandboxConfinement` is `true` (fail closed). Policy receives the owning DSH session id, never the model-chosen kernel sub-session id. |
 | `sandboxWorkspaceRoot` | `process.cwd()` | Writable root under `workspace-write` confinement. |
 | `sandboxMode` | `'workspace-write'` | File-effect mode for confined kernels (`'read-only'` or `'workspace-write'`). |
 
@@ -99,10 +103,13 @@ It resolves the seam's result envelope — `value` (JSON completion), `logs`, `e
 
 - **Sessions.** A call with a non-empty `session` runs in that session's kernel; `executionCount` reports the running count. `reset: true` shuts the old kernel down before a fresh one answers.
 - **One-shot.** Without `session`, a fresh kernel is spawned, exactly one program runs, and the kernel is shut down.
+- **Working directory.** Every tool call resolves the conversation's current working directory. Resolution failures fail the call; a fresh kernel's preload and user cell receive the same directory.
+- **Child environment.** Kernel processes use DSH's credential-safe parent-environment scrub, then add only deliberate runner controls. Ambient credential-shaped and `DSH_*` entries do not reach model code.
 - **Persistence.** Python: module-level variables and loop state survive across cells. JavaScript: `state` (a long-lived shared object) and sloppy-mode global assignments survive; `const`/`let`/`function`/`class` at cell top level are per-cell (async body), so persistent definitions go on `state`. A cell completes `return <json>` for a completion value, or with no `return` for a no-value run; non-lossless completions (cycles, `BigInt`, sets) are `'invalid-output'`.
+- **JavaScript imports.** Dynamic imports use Node's native ESM loader from the call's working directory, including `exports` import conditions, package `imports`, import attributes, and absolute filesystem paths.
 - **Snapshots.** After each successful run the namespace is saved (Python: `pickle` + `marshal` for bytecode, per-name loss reporting; JavaScript: V8 binary serialization, so `Map`/`Set`/`Date`/cyclic values survive but function-valued keys are named as lost). A fresh kernel for the session restores the last snapshot once — the restoring run's logs carry `[dsh-kernels] restored N names from snapshot (could not restore: …)`. `reset: true` deletes the snapshot first, so it never resurrects discarded state. Python bytecode is `marshal`-format-dependent: restoring across a Python minor-version upgrade should be expected to lose function/class entries (named in the notice), not data.
 - **Toolbox.** With `preload` set, every fresh session kernel runs the language's source as one hidden first cell before the snapshot restores: helpers behave like any other session state (they ride snapshots; a restored name shadows a same-named helper). Its output is hidden from the model; a preload failure fails the run it triggered.
-- **Budgets and failure kinds.** Wall-clock expiry → `'timeout'`; cancellation or a kernel that had to die → `'abort'`; thrown exceptions → `'exception'`; non-JSON completions → `'invalid-output'`; combined output overflow → `'output-limit'`; kernel death → the session registry replaces the kernel and retries once. All are result FIELDS, never rejections of the tool.
+- **Budgets and failure kinds.** Wall-clock expiry → `'timeout'`; cancellation or a kernel that had to die → `'abort'`; thrown exceptions → `'exception'`; non-JSON completions → `'invalid-output'`; combined output overflow → `'output-limit'`; spontaneous kernel death → `'worker-exit'`. A dead kernel is retired without replaying the failed cell; the next call starts fresh. All are result fields, never tool-call rejections.
 
 ## Model experience
 
@@ -111,6 +118,7 @@ The system-prompt guide tells the model to prefer `run_kernel_code` over scratch
 ## Known limitations
 
 - **A busy synchronous cell resists SIGINT.** A `while (true) {}`/`while True:` loop never yields to the event loop, so the interrupt handler cannot run and the escalation ladder (SIGTERM then SIGKILL) is what actually stops it — costing the kernel's state, hence the session. Cells that yield (async `await` on timers/I/O/tool calls) cancel cleanly and the kernel survives (the wall-clock/timeout tests cover this split).
+- **Capture truncation is irreversible.** When one kernel frame crosses the host capture cap, the result and spill metadata identify the spill as a retained prefix; the discarded tail is not claimed as recoverable.
 - **State can be poisoned.** A buggy program can corrupt the session's state at any time; `reset: true` is the intended recovery primitive (it also deletes the snapshot, so the corruption cannot come back).
 - **No security boundary.** Kernel code has bash-equivalent trust, matching the harness's own process backends — and so do snapshot files (`pickle`/`marshal` are not safe to read from untrusted input). Keep `snapshotDir` user-private; a planted snapshot executes as the host.
 - **Snapshot granularity is per-name.** Python: data, modules, importable callables, and `__main__`-defined functions/classes are saved by value; user-class instances, closures over non-picklables, and entries past the caps are named as lost on the next restore. JavaScript: `state` and sloppy-mode global assignments are saved per key; a function anywhere inside a key's value discards that whole key (named).

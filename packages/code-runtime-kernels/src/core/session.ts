@@ -12,6 +12,7 @@
 import { randomUUID } from 'node:crypto'
 import { rmSync } from 'node:fs'
 import type { PtcBindingNamespace } from '@deepseek-ai/dsh-ptc-runtime'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { KernelExecResult, KernelHost } from './kernel.ts'
 import type { SnapshotSpec } from './protocol.ts'
 
@@ -43,7 +44,7 @@ export interface SessionRegistryConfig {
   /** Label for error messages (e.g. `python kernel`). */
   label: string
   /** Spawn a fresh kernel for a newly acquired session (provider-resolved executable + timeouts). */
-  start: (signal?: AbortSignal, sessionId?: string) => Promise<KernelHost>
+  start: (signal?: AbortSignal, sandboxSessionId?: SessionId) => Promise<KernelHost>
   /** Reap a session whose kernel sits unused for this long; 0 disables. */
   sessionIdleMs: number
   /**
@@ -79,6 +80,8 @@ export interface SessionRunOptions {
   cwd?: string
   /** Per-run environment overrides. */
   env?: Record<string, string>
+  /** Owning DSH session for sandbox policy; never the kernel sub-session id. */
+  sandboxSessionId?: SessionId
 }
 
 /**
@@ -93,7 +96,7 @@ export class SessionRegistry {
   readonly #sessions = new Map<string, KernelSession>()
   readonly #config: SessionRegistryConfig
   #disposed: boolean = false
-
+  #disposalPromise: Promise<void> | undefined
   constructor(config: SessionRegistryConfig) {
     this.#config = config
   }
@@ -157,19 +160,26 @@ export class SessionRegistry {
     if (kernel !== null) await kernel.shutdown().catch(() => {})
   }
 
-  /** Terminate every kernel and drop every session (runtime disposal). */
-  async disposeAll(): Promise<void> {
-    if (this.#disposed) return
+  /** Terminate every attached kernel and wait for all queued acquisitions. */
+  disposeAll(): Promise<void> {
+    this.#disposalPromise ??= this.#disposeAll()
+    return this.#disposalPromise
+  }
+
+  async #disposeAll(): Promise<void> {
     this.#disposed = true
     const sessions = [...this.#sessions.values()]
-    this.#sessions.clear()
     const kernels: KernelHost[] = []
     for (const session of sessions) {
       clearTimeout(session.idleTimer)
       if (session.kernel !== null) kernels.push(session.kernel)
-      session.kernel = null
     }
-    await Promise.allSettled(kernels.map(kernel => kernel.shutdown()))
+    await Promise.allSettled([
+      ...kernels.map(kernel => kernel.shutdown()),
+      ...sessions.map(session => session.queue),
+    ])
+    for (const session of sessions) session.kernel = null
+    this.#sessions.clear()
   }
 
   #maybeReap(sessionId: string): void {
@@ -200,7 +210,7 @@ export class SessionRegistry {
     }
   }
 
-  async #acquireKernel(sessionId: string, session: KernelSession, signal?: AbortSignal): Promise<KernelHost> {
+  async #acquireKernel(sessionId: string, session: KernelSession, options: SessionRunOptions): Promise<KernelHost> {
     if (session.kernel !== null && session.kernel.isAlive()) return session.kernel
     const previous = session.kernel
     if (previous !== null) {
@@ -211,7 +221,7 @@ export class SessionRegistry {
     if (this.#sessions.get(sessionId) !== session) {
       throw new Error(`${this.#config.label} session invalidated while acquiring kernel`)
     }
-    const kernel = await this.#config.start(signal, sessionId)
+    const kernel = await this.#config.start(options.signal, options.sandboxSessionId)
     if (this.#disposed) {
       await kernel.shutdown().catch(() => {})
       this.#assertNotDisposed()
@@ -223,12 +233,11 @@ export class SessionRegistry {
     session.kernel = kernel
     const preload = this.#config.preload?.()
     if (preload !== undefined && preload.length > 0) {
-      // Hidden first cell: no snapshot spec, so the restore (and its notice)
-      // still belongs to the user's first real exec. A failed preload must
-      // not leave a half-configured kernel behind; fail the run instead.
-      // The caller's abort signal applies to preload work too: an aborted
-      // admission must not keep starting a kernel it will never use.
-      const prepared = await kernel.execute(`preload-${randomUUID()}`, preload, [], signal !== undefined ? { signal } : {})
+      const prepared = await kernel.execute(`preload-${randomUUID()}`, preload, [], {
+        ...options.signal !== undefined ? { signal: options.signal } : {},
+        ...options.cwd !== undefined ? { cwd: options.cwd } : {},
+        ...options.env !== undefined ? { env: options.env } : {},
+      })
       if (prepared.status !== 'ok' || prepared.killed || prepared.cancelled) {
         await kernel.shutdown().catch(() => {})
         session.kernel = null
@@ -284,7 +293,7 @@ export class SessionRegistry {
     }
     let kernel: KernelHost
     try {
-      kernel = await this.#acquireKernel(sessionId, session, options.signal)
+      kernel = await this.#acquireKernel(sessionId, session, options)
     } catch (error: unknown) {
       if (error instanceof KernelPreloadError) return error.result
       throw error
@@ -297,23 +306,16 @@ export class SessionRegistry {
     // would see. The next invocation starts fresh (restoring the last saved
     // snapshot, when snapshots are on).
     if (first.cancelled && callerAborted() && this.#config.retireOnCancel === true) {
-      // Keep the registry entry: earlier admissions of this session are still
-      // chained on THIS session object, and deleting the entry would make
-      // their identity check reject ("session invalidated") without running.
-      // `kernel = null` already forces the next invocation onto a fresh kernel.
-      session.kernel = null
       await kernel.shutdown().catch(() => {})
+      if (session.kernel === kernel) session.kernel = null
       return first
     }
     // A kernel that died settling the run is retired — never reused, and the
-    // run is NEVER retried: re-executing model code the caller did not ask to
-    // re-run would double external effects (files appended twice, requests
-    // duplicated). `crashed` lets the host surface the worker-exit warning;
-    // the next invocation starts on a fresh kernel. The registry entry stays
-    // (queued siblings keep their chain and pending count).
+    // run is NEVER retried: re-executing model code could duplicate external
+    // effects. The next queued invocation starts a fresh kernel.
     if (first.killed || !kernel.isAlive()) {
-      session.kernel = null
       await kernel.shutdown().catch(() => {})
+      if (session.kernel === kernel) session.kernel = null
       return first
     }
     return first

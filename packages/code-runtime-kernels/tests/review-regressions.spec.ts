@@ -7,13 +7,16 @@
  * session identity at the tool layer. Real subprocesses throughout.
  */
 
-import { chmodSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
+import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { afterEach, describe, expect, it } from 'vitest'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
+import { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
 import { Context } from '@deepseek-ai/cordis'
+import type { KernelSandboxProvider } from '../src/core/kernel.ts'
 import * as Kernels from '../src/index.ts'
 import { cleanTempSnapshotDirs, tempSnapshotDir } from './test-util.ts'
 
@@ -114,15 +117,16 @@ describe('review regressions — process surface (finding 4)', () => {
     }
   })
 
-  it('scrubs DSH_* environment entries and keeps deliberate kernel env', async () => {
+  it('scrubs harness and credential environment entries while keeping deliberate kernel env', async () => {
     process.env.DSH_PROBE_MARKER = 'must-not-leak'
+    process.env.DEEPSEEK_API_KEY = 'credential-must-not-leak'
     try {
       await withManager(async (manager) => {
         const scrubbed = await manager.run({
           language: 'python',
-          code: "__import__('os').environ.get('DSH_PROBE_MARKER')",
+          code: "dict(dsh=__import__('os').environ.get('DSH_PROBE_MARKER'), key=__import__('os').environ.get('DEEPSEEK_API_KEY'))",
         })
-        expect(scrubbed.value).toBeNull()
+        expect(scrubbed.value).toEqual({ dsh: null, key: null })
         const deliberate = await manager.run({
           language: 'python',
           code: "type(__import__('os').environ.get('DSH_KERNEL_CWD')).__name__",
@@ -131,6 +135,7 @@ describe('review regressions — process surface (finding 4)', () => {
       })
     } finally {
       delete process.env.DSH_PROBE_MARKER
+      delete process.env.DEEPSEEK_API_KEY
     }
   })
 })
@@ -158,6 +163,104 @@ describe('review regressions — cancellation ghost (finding 2)', () => {
       })
       expect(next.value).toBe('gone')
     })
+  })
+})
+
+describe('review regressions — teardown ownership', () => {
+  it('aborts a child that is still waiting for its startup handshake', async () => {
+    const pidFile = join(tempSnapshotDir(), 'startup.pid')
+    const childSource = `require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid)); setInterval(() => {}, 1000)`
+    const provider: KernelSandboxProvider = {
+      async confine() {
+        return { argv: [process.execPath, '-e', childSource] }
+      },
+    }
+    const manager = makeManager({
+      sandboxConfinement: true,
+      sandboxProvider: provider,
+      snapshot: false,
+      startupTimeoutMs: 60_000,
+      shutdownGraceMs: 20,
+    })
+    try {
+      const run = manager.run({
+        language: 'typescript',
+        sessionId: 'startup-teardown',
+        code: 'return 1',
+      })
+      const settled = run.catch(error => error)
+      await expect.poll(() => existsSync(pidFile), { timeout: 5_000 }).toBe(true)
+      const pid = Number(readFileSync(pidFile, 'utf8'))
+      await expect(manager.teardown()).resolves.toBeUndefined()
+      expect(await settled).toMatchObject({ error: { kind: 'abort' } })
+      expect(() => process.kill(pid, 0)).toThrow()
+    } finally {
+      await manager.teardown()
+    }
+  })
+
+  it('aborts and drains an executing one-shot before teardown resolves', async () => {
+    const entered = Promise.withResolvers<void>()
+    const manager = makeManager({ interruptEscalationMs: 20, shutdownGraceMs: 20 })
+    try {
+      const run = manager.run({
+        language: 'typescript',
+        code: 'await probe.started({}); await new Promise(() => {})',
+        bindings: [{
+          global: 'probe',
+          functions: {
+            started: async () => {
+              entered.resolve()
+              return true
+            },
+          },
+        }],
+      })
+      await entered.promise
+      const teardown = manager.teardown()
+      const result = await run
+      await expect(teardown).resolves.toBeUndefined()
+      expect(result.error?.kind).toBe('abort')
+    } finally {
+      await manager.teardown()
+    }
+  })
+})
+
+describe('review regressions — execution context ownership', () => {
+  it('runs preload and user cells in the same requested working directory', async () => {
+    const cwd = tempSnapshotDir()
+    await withManager(async (manager) => {
+      const result = await manager.run({
+        language: 'typescript',
+        sessionId: 'preload-cwd',
+        cwd,
+        code: 'return { preload: state.preloadCwd, current: process.cwd() }',
+      })
+      expect(result.error).toBeUndefined()
+      expect(result.value).toEqual({ preload: realpathSync(cwd), current: realpathSync(cwd) })
+    }, { preload: { typescript: 'state.preloadCwd = process.cwd()' } })
+  })
+
+  it('passes only the owning DSH session to sandbox policy', async () => {
+    const observed: Array<SessionId | undefined> = []
+    const provider: KernelSandboxProvider = {
+      async confine(argv, policy) {
+        observed.push(policy.sessionId)
+        return { argv: [...argv] }
+      },
+    }
+    const owner = SessionId('owner-a')
+    await withManager(async (manager) => {
+      const result = await manager.run({
+        language: 'typescript',
+        sessionId: 'owner-a:analysis',
+        sandboxSessionId: owner,
+        code: 'return 1',
+      })
+      expect(result.error).toBeUndefined()
+    }, { sandboxConfinement: true, sandboxProvider: provider, snapshot: false })
+    expect(observed).toEqual([owner])
   })
 })
 
@@ -216,6 +319,48 @@ describe('review regressions — snapshot persistence status (finding 8)', () =>
   })
 })
 
+describe('review regressions — output accounting', () => {
+  it('reports a single oversized frame as output-limit and labels its spill as partial', async () => {
+    const captures: Array<Kernels.OutputLimitInfo & { content: string }> = []
+    await withManager(async (manager) => {
+      const result = await manager.run({
+        language: 'python',
+        code: "print('z' * 3000)",
+      }, async (content, info) => {
+        captures.push({ content, ...info })
+        return 'spill://kernel-output-prefix'
+      })
+      expect(result.error?.kind).toBe('output-limit')
+      expect(result.error?.message).toContain('discarded tail unavailable')
+      expect(captures).toHaveLength(1)
+      expect(captures[0]?.complete).toBe(false)
+      expect(captures[0]?.content).toContain('z'.repeat(512))
+    }, { maxOutputBytes: 1024 })
+  })
+
+  it('never returns a completion value alongside an output-limit failure', async () => {
+    await withManager(async (manager) => {
+      const result = await manager.run({
+        language: 'typescript',
+        code: "console.log('small'); return 'v'.repeat(300)",
+      })
+      expect(result.error?.kind).toBe('output-limit')
+      expect(result.value).toBeUndefined()
+    }, { maxOutputBytes: 128 })
+  })
+
+  it('preserves an ordinary diagnostic that fits the configured budget', async () => {
+    await withManager(async (manager) => {
+      const result = await manager.run({
+        language: 'python',
+        code: "raise ValueError('diagnostic-' + 'e' * 200)",
+      })
+      expect(result.error?.kind).toBe('exception')
+      expect(result.error?.message).toContain(`diagnostic-${'e'.repeat(200)}`)
+    }, { maxOutputBytes: 512 })
+  })
+})
+
 describe('review regressions — TypeScript truthfulness (finding 7)', () => {
   it('strips erasable type annotations and resolves dynamic imports', async () => {
     await withManager(async (manager) => {
@@ -227,6 +372,42 @@ describe('review regressions — TypeScript truthfulness (finding 7)', () => {
       })
       expect(result.error).toBeUndefined()
       expect(result.value).toEqual({ n: 41, t: 'function', j: 'function' })
+    })
+  })
+
+  it('uses native ESM conditions, import attributes, package imports, and absolute paths', async () => {
+    const cwd = tempSnapshotDir()
+    const packageDir = join(cwd, 'node_modules', 'import-only-fixture')
+    mkdirSync(packageDir, { recursive: true })
+    writeFileSync(join(packageDir, 'package.json'), JSON.stringify({
+      name: 'import-only-fixture',
+      type: 'module',
+      exports: { import: './index.mjs' },
+    }))
+    writeFileSync(join(packageDir, 'index.mjs'), 'export const packageValue = 41\n')
+    writeFileSync(join(cwd, 'package.json'), JSON.stringify({
+      type: 'module',
+      imports: { '#local-fixture': './local.mjs' },
+    }))
+    writeFileSync(join(cwd, 'local.mjs'), 'export const localValue = 42\n')
+    writeFileSync(join(cwd, 'absolute.mjs'), 'export const absoluteValue = 43\n')
+    writeFileSync(join(cwd, 'value.json'), '{"jsonValue":44}\n')
+
+    await withManager(async (manager) => {
+      const absolutePath = join(cwd, 'absolute.mjs')
+      const result = await manager.run({
+        language: 'typescript',
+        cwd,
+        code: [
+          "const pkg = await import('import-only-fixture')",
+          "const local = await import('#local-fixture')",
+          `const absolute = await import(${JSON.stringify(absolutePath)})`,
+          "const json = await import('./value.json', { with: { type: 'json' } })",
+          'return { packageValue: pkg.packageValue, localValue: local.localValue, absoluteValue: absolute.absoluteValue, jsonValue: json.default.jsonValue }',
+        ].join('\n'),
+      })
+      expect(result.error).toBeUndefined()
+      expect(result.value).toEqual({ packageValue: 41, localValue: 42, absoluteValue: 43, jsonValue: 44 })
     })
   })
 
@@ -266,6 +447,33 @@ describe('review regressions — per-conversation session identity (finding 1)',
       expect(mine.isError).toBe(false)
       const mineText = mine.content.filter(block => block.type === 'text').map(block => block.text).join('')
       expect(mineText).toContain('value: 99')
+    } finally {
+      await fiber.dispose()
+      cleanTempSnapshotDirs()
+    }
+  })
+
+  it('surfaces working-directory resolution failures instead of running in host cwd', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SystemPrompt)
+    await ctx.plugin(ToolRuntime, {})
+    ctx.provide('workingDirectory' as never, {
+      ensure: async () => {
+        throw new Error('workspace is unavailable')
+      },
+    } as never)
+    const fiber = ctx.plugin(Kernels, { languages: ['python'], snapshotDir: tempSnapshotDir() })
+    try {
+      const result = await ctx.tools.execute({
+        signal: new AbortController().signal,
+        callId: ToolCallId('rr-working-directory-failure'),
+        name: 'run_kernel_code',
+        arguments: { language: 'python', code: '1 + 1' },
+        agent: { session: { header: { id: 'cwd-failure', cwd: process.cwd() } } } as never,
+      })
+      expect(result.isError).toBe(true)
+      const text = result.content.filter(block => block.type === 'text').map(block => block.text).join('')
+      expect(text).toContain('workspace is unavailable')
     } finally {
       await fiber.dispose()
       cleanTempSnapshotDirs()

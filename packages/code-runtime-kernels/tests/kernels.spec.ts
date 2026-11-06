@@ -11,6 +11,7 @@
 import { afterEach, describe, expect, it } from 'vitest'
 import type { PtcBindingNamespace } from '@deepseek-ai/dsh-ptc-runtime'
 import { KernelManager } from '../src/index.ts'
+import type { OutputLimitInfo } from '../src/index.ts'
 import { cleanTempSnapshotDirs, tempSnapshotDir } from './test-util.ts'
 
 const LANGUAGES = ['python', 'typescript'] as const
@@ -213,30 +214,31 @@ describe('persistent kernels — failure taxonomy', () => {
 
     it(`spills the full output on an output overrun (${language})`, async () => {
       await withManager(async (manager) => {
-        const spilled: string[] = []
+        const spilled: Array<OutputLimitInfo & { content: string }> = []
         const code = language === 'python'
           ? "'x' * 200"
           : "return 'x'.repeat(200)"
-        const result = await manager.run({ language, code }, async (content) => {
-          spilled.push(content)
+        const result = await manager.run({ language, code }, async (content, info) => {
+          spilled.push({ content, ...info })
           return 'spill://kernel-output-1'
         })
         expect(result.error?.kind).toBe('output-limit')
         expect(result.error?.message).toContain('full program output preserved at spill://kernel-output-1')
         expect(spilled).toHaveLength(1)
-        expect(spilled[0]).toContain('[completion value]')
-        expect(spilled[0]).toContain('x'.repeat(200))
+        expect(spilled[0]?.complete).toBe(true)
+        expect(spilled[0]?.content).toContain('[completion value]')
+        expect(spilled[0]?.content).toContain('x'.repeat(200))
       }, { maxOutputBytes: 64 })
     })
 
     it(`keeps the truncated result when the spill hook declines (${language})`, async () => {
       await withManager(async (manager) => {
-        const called: string[] = []
+        const called: Array<OutputLimitInfo & { content: string }> = []
         const code = language === 'python'
           ? "'x' * 200"
           : "return 'x'.repeat(200)"
-        const result = await manager.run({ language, code }, async (content) => {
-          called.push(content)
+        const result = await manager.run({ language, code }, async (content, info) => {
+          called.push({ content, ...info })
           return undefined
         })
         expect(result.error?.kind).toBe('output-limit')

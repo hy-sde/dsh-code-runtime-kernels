@@ -16,6 +16,7 @@ import { rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { PtcBindingNamespace, PtcJsonValue } from '@deepseek-ai/dsh-ptc-runtime'
+import type { SessionId } from '@deepseek-ai/dsh-session'
 import { snapshotJsonValue } from '@deepseek-ai/dsh-util-values'
 import type { DoneFrame, KernelFrame, KernelHostMessage, SnapshotSpec } from './protocol.ts'
 import { LineSplitter } from './lines.ts'
@@ -67,7 +68,7 @@ export interface KernelStartConfig {
    * a fallback. The wrapper becomes the process-group leader; the escalation
    * ladder unwinds through it.
    */
-  confine?: (argv: readonly string[], signal?: AbortSignal, sessionId?: string) => Promise<{ argv: string[] }>
+  confine?: (argv: readonly string[], signal?: AbortSignal, sessionId?: SessionId) => Promise<{ argv: string[] }>
   /**
    * Cancellation for the confinement call itself (the triggering run's
    * signal): an aborted or failing confine fails the start structured, never
@@ -78,12 +79,10 @@ export interface KernelStartConfig {
    * Owning DSH session id, when the run belongs to one — forwarded into the
    * confinement policy so per-session sandbox grants apply.
    */
-  sessionId?: string
+  sandboxSessionId?: SessionId
   /**
-   * Upper bound on captured log bytes per run (combined output-budget
-   * enforcement happens at capture time, not just at finalization). When the
-   * cap is hit a truncation marker replaces further output; `undefined`
-   * disables the cap (tests).
+   * Upper bound on captured log bytes per run. On overflow the host retains a
+   * UTF-8-safe prefix and marks the missing tail; `undefined` disables the cap.
    */
   captureCapBytes?: number
 }
@@ -99,7 +98,7 @@ export interface KernelSandboxPolicy {
   mode: 'read-only' | 'workspace-write'
   workspaceRoot: string
   /** Owning DSH session, when the run has one (forwarded to the provider). */
-  sessionId?: string
+  sessionId?: SessionId
 }
 
 export interface KernelSandboxProvider {
@@ -140,7 +139,7 @@ interface PendingRun {
   crashed?: boolean
   /** Captured log bytes so far (capture-cap accounting). */
   captureBytes: number
-  /** True once the capture cap has been hit and the marker emitted. */
+  /** True once the capture cap discarded an output tail. */
   captureTruncated: boolean
   persistence?: KernelPersistenceStatus
   done: Promise<void>
@@ -166,6 +165,8 @@ export interface KernelExecResult {
   killed: boolean
   /** True when the kernel process died without host-initiated termination (maps to `worker-exit`). */
   crashed?: boolean
+  /** True when host-side capture discarded an output tail. */
+  captureTruncated?: boolean
   /** Snapshot persistence status when the run carried a snapshot spec. */
   persistence?: KernelPersistenceStatus
 }
@@ -181,9 +182,8 @@ export function nodejsKernelProfile(command: string): KernelRuntimeProfile {
   return {
     key: 'typescript',
     command,
-    // --experimental-vm-modules: the runner's compileFunction import callback
-    // (deliberate dynamic-import resolution for cells) is honored only with
-    // this flag; without it `await import(...)` inside a cell hard-fails.
+    // compileFunction delegates dynamic imports to Node's main ESM loader;
+    // vm modules must be enabled for that loader to run inside compiled cells.
     argvPrefix: ['--no-warnings', '--experimental-vm-modules'],
     runnerPath: RUNNER_PATH,
     prefix: 'dsh-code-runtime-kernels-nodejs',
@@ -368,12 +368,10 @@ export class KernelHost {
    * (grading the fresh subprocess up to termination behind us).
    */
   static async start(profile: KernelRuntimeProfile, config: KernelStartConfig): Promise<KernelHost> {
+    if (config.signal?.aborted) {
+      throw new Error(`${profile.prefix}: kernel start aborted (${tryMessageOf(config.signal.reason)})`)
+    }
     const argv: string[] = [...profile.argvPrefix]
-
-    // A runner may be a shipped file, or embedded source staged to a scratch
-    // file per spawn (tempdirs are shared host state; the embedded code may
-    // change between versions). Only the staged variant touches the disk, in
-    // an owner-private per-uid dir re-validated on every spawn.
     let stagedPath: string | undefined
     if (profile.stagedSource !== undefined) {
       stagedPath = join(
@@ -388,68 +386,100 @@ export class KernelHost {
     }
     const runnerArg = stagedPath ?? profile.runnerPath
     if (runnerArg !== undefined) argv.push(runnerArg)
-    const fullArgv = [...argv]
-    if (profile.command !== undefined) fullArgv.unshift(profile.command)
+    const fullArgv = [profile.command, ...argv]
 
-    // `--no-warnings` for the Node runner is statically safe: a development
-    // spawn of the .ts kernel would otherwise leak the type-stripping
-    // ExperimentalWarning into the captured stderr. Python gets unfiltered
-    // stdout via -u plus PYTHONUNBUFFERED/PYTHONIOENCODING.
-    // `detached: true` on POSIX calls setsid(2), making the runner a session
-    // leader: anything it spawns stays in ITS process group, so a shutdown can
-    // sweep the whole tree via killProcessGroup (the #7714 orphan fix) instead
-    // of leaving grandchildren holding the kernel's pipes open.
-    // The confine seam is async and fail-closed: a rejection (provider bug,
-    // sandbox unavailable, caller abort) is a structured start failure — it
-    // must never reach `spawn` as a bogus argv and never crash the host.
     let wrapped: readonly string[]
     if (config.confine !== undefined) {
       try {
-        wrapped = (await config.confine(fullArgv, config.signal, config.sessionId)).argv
+        const confinement = config.confine(fullArgv, config.signal, config.sandboxSessionId)
+        const cancellation = Promise.withResolvers<never>()
+        const onAbort = (): void => {
+          cancellation.reject(new Error(`kernel start aborted (${tryMessageOf(config.signal?.reason)})`))
+        }
+        if (config.signal !== undefined) {
+          if (config.signal.aborted) onAbort()
+          else config.signal.addEventListener('abort', onAbort, { once: true })
+        }
+        try {
+          const confined = config.signal === undefined
+            ? await confinement
+            : await Promise.race([confinement, cancellation.promise])
+          wrapped = confined.argv
+        } finally {
+          config.signal?.removeEventListener('abort', onAbort)
+        }
       } catch (error: unknown) {
+        if (stagedPath !== undefined) {
+          try { rmSync(stagedPath) } catch { /* best effort */ }
+        }
         throw new Error(`${profile.prefix}: sandbox confinement failed: ${tryMessageOf(error)}`)
       }
       if (!Array.isArray(wrapped) || wrapped.length === 0 || wrapped.some(entry => typeof entry !== 'string')) {
+        if (stagedPath !== undefined) {
+          try { rmSync(stagedPath) } catch { /* best effort */ }
+        }
         throw new Error(`${profile.prefix}: sandbox confinement returned a malformed argv`)
       }
     } else {
       wrapped = fullArgv
     }
-    const proc = spawn(wrapped[0] ?? profile.command, wrapped.slice(1), {
-      cwd: config.cwd,
-      env: { ...(config.env ?? process.env), ...profile.env },
-      stdio: ['pipe', 'pipe', 'pipe'],
-      detached: process.platform !== 'win32',
-      windowsHide: true,
-    })
+    if (config.signal?.aborted) {
+      if (stagedPath !== undefined) {
+        try { rmSync(stagedPath) } catch { /* best effort */ }
+      }
+      throw new Error(`${profile.prefix}: kernel start aborted (${tryMessageOf(config.signal.reason)})`)
+    }
+
+    let proc: ChildProcess
+    try {
+      proc = spawn(wrapped[0] ?? profile.command, wrapped.slice(1), {
+        cwd: config.cwd,
+        env: { ...(config.env ?? process.env), ...profile.env },
+        stdio: ['pipe', 'pipe', 'pipe'],
+        detached: process.platform !== 'win32',
+        windowsHide: true,
+      })
+    } catch (error: unknown) {
+      if (stagedPath !== undefined) {
+        try { rmSync(stagedPath) } catch { /* best effort */ }
+      }
+      throw error
+    }
     if (proc.pid === undefined) proc.unref()
     const kernel = new KernelHost(profile, stagedPath, proc, config)
     kernel.id = `${profile.idPrefix}${Math.random().toString(36).slice(2, 10)}`
     kernel.pid = proc.pid
+
+    const startupTimeout = Promise.withResolvers<never>()
+    const startupTimer = setTimeout(() => {
+      startupTimeout.reject(new Error(`${profile.prefix}: kernel did not become ready within ${config.startupTimeoutMs}ms`))
+    }, config.startupTimeoutMs)
+    startupTimer.unref()
+    const aborted = Promise.withResolvers<never>()
+    let onAbort: (() => void) | undefined
+    if (config.signal !== undefined) {
+      onAbort = () => {
+        aborted.reject(new Error(`${profile.prefix}: kernel start aborted (${tryMessageOf(config.signal?.reason)})`))
+      }
+      if (config.signal.aborted) onAbort()
+      else config.signal.addEventListener('abort', onAbort, { once: true })
+    }
     try {
       await Promise.race([
         kernel.#ready,
-        // An early exit before the handshake must fail the start FAST (a
-        // runner that cannot even boot — missing interpreter feature, syntax
-        // error in a staged script — otherwise costs the full startup budget).
         kernel.#exited.then((code: number) => {
           throw new Error(`${profile.prefix}: kernel exited with code ${code} before becoming ready`)
         }),
-        new Promise<never>((_resolve, reject) => {
-          const timer = setTimeout(() => { reject(new Error(
-            `${profile.prefix}: kernel did not become ready within ${config.startupTimeoutMs}ms`,
-          )) }, config.startupTimeoutMs)
-          timer.unref()
-        }),
+        startupTimeout.promise,
+        aborted.promise,
       ])
       return kernel
     } catch (error: unknown) {
-      // An early exit already settled every in-flight run (none); a start
-      // timeout must grade the half-booted subprocess up to termination.
-      await kernel.killForFailedStart(typeof error === 'object' && error !== null
-        ? tryMessageOf(error)
-        : `${profile.label} startup failed`)
+      await kernel.killForFailedStart(tryMessageOf(error))
       throw error
+    } finally {
+      clearTimeout(startupTimer)
+      if (onAbort !== undefined) config.signal?.removeEventListener('abort', onAbort)
     }
   }
 
@@ -538,6 +568,12 @@ export class KernelHost {
     namespaces: PtcBindingNamespace[],
     options: { signal?: AbortSignal; cwd?: string; env?: Record<string, string>; snapshot?: SnapshotSpec } = {},
   ): Promise<KernelExecResult> {
+    if (options.signal?.aborted) {
+      return {
+        status: 'error', logs: [], cancelled: true, invalidOutput: false,
+        message: 'run aborted before the kernel admitted it', killed: false,
+      }
+    }
     if (!this.isAlive()) {
       return {
         status: 'error', logs: [], cancelled: false, invalidOutput: false,
@@ -622,28 +658,41 @@ export class KernelHost {
       invalidOutput: run.invalidOutput,
       message: run.message,
       killed: run.killed,
+      ...run.captureTruncated ? { captureTruncated: true } : {},
       ...run.crashed ? { crashed: true } : {},
       ...run.persistence !== undefined ? { persistence: run.persistence } : {},
     }
   }
 
   /**
-   * Append one captured-output chunk with the per-run capture cap applied:
-   * once the cap is hit, a single marker line is retained and everything
-   * after it is discarded (host memory stays bounded even when the runner's
-   * own output accounting is bypassed, e.g. child-process stdout forwarded
-   * as kernel output).
+   * Append one captured-output chunk. On overflow, retain a UTF-8-safe prefix
+   * up to the cap and mark the missing tail explicitly on the result.
    */
   #appendLog(run: PendingRun, text: string, stream: string): void {
     const cap = this.#captureCapBytes
-    if (cap === undefined || run.captureTruncated) return
-    if (run.captureBytes + Buffer.byteLength(text) > cap) {
-      run.captureTruncated = true
-      run.logs.push({ text: `[dsh-kernels] output capture truncated at ${cap} bytes; further kernel output discarded`, stream: 'stderr' })
+    if (run.captureTruncated) return
+    if (cap === undefined) {
+      run.logs.push({ text, stream })
       return
     }
-    run.captureBytes += Buffer.byteLength(text)
-    run.logs.push({ text, stream })
+    const bytes = Buffer.byteLength(text)
+    if (run.captureBytes + bytes <= cap) {
+      run.captureBytes += bytes
+      run.logs.push({ text, stream })
+      return
+    }
+    let remaining = Math.max(0, cap - run.captureBytes)
+    const source = Buffer.from(text, 'utf8')
+    let prefix = source.subarray(0, remaining).toString('utf8')
+    while (remaining > 0 && Buffer.byteLength(prefix) > remaining) {
+      remaining -= 1
+      prefix = source.subarray(0, remaining).toString('utf8')
+    }
+    if (prefix.length > 0) {
+      run.logs.push({ text: prefix, stream })
+      run.captureBytes += Buffer.byteLength(prefix)
+    }
+    run.captureTruncated = true
   }
 
   /** Request cancellation of the in-flight run via SIGINT, escalating to termination. */
@@ -703,7 +752,7 @@ export class KernelHost {
       run.finalize()
     }
     const exited = this.#exited
-    await this.#write({ type: 'exit' }).catch(() => {})
+    void this.#write({ type: 'exit' }).catch(() => {})
     const grace = (): Promise<'timeout'> => new Promise<'timeout'>((resolve) => {
       const timer = setTimeout(() => { resolve('timeout') }, this.#shutdownGraceMs)
       timer.unref()
@@ -740,6 +789,8 @@ export class KernelHost {
     timer.unref()
     await this.#exited.catch(() => {})
     clearTimeout(timer)
+    // The leader can exit before its descendants; always finish the group.
+    killProcessGroup(this.#proc.pid, 'SIGKILL')
   }
 
   #onProcessExit(code: number): void {
