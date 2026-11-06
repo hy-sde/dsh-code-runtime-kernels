@@ -13,6 +13,7 @@ import { Context } from '@deepseek-ai/cordis'
 import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import {
   doneFailure,
   parseKernelFrame,
@@ -28,14 +29,14 @@ import * as Kernels from '../src/index.ts'
 const testToolSignal = new AbortController().signal
 let callCounter = 0
 
-function call(name: string, args: unknown) {
-  return ctx.tools.execute({
+async function call(name: string, args: unknown) {
+  // 0.2.2 dispatches whole model batches; wrap the single call and unwrap its result.
+  const batch = await ctx.tools.execute({
+    calls: [{ type: 'tool-call' as const, id: ToolCallId(`it-${++callCounter}`), name, arguments: JSON.stringify(args)}],
     signal: testToolSignal,
-    callId: ToolCallId(`it-${++callCounter}`),
-    name,
-    arguments: args,
     agent: { session: { header: { id: 'sess-tool', cwd: process.cwd() } } } as never,
   })
+  return batch.results[0]!.result
 }
 
 let ctx: Context
@@ -103,6 +104,7 @@ describe('run_kernel_code over the real tool runtime', () => {
     ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime, {})
+    await ctx.plugin(NativeToolExecutor)
     kernelsFiber = ctx.plugin(Kernels, { languages: ['python', 'typescript'], snapshotDir: tempSnapshotDir() })
     await kernelsFiber
   })

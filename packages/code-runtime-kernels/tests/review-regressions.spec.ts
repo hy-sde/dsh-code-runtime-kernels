@@ -15,6 +15,7 @@ import { ToolCallId } from '@deepseek-ai/dsh-llm'
 import { SessionId } from '@deepseek-ai/dsh-session'
 import SystemPrompt from '@deepseek-ai/dsh-system-prompt'
 import ToolRuntime from '@deepseek-ai/dsh-tools'
+import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { Context } from '@deepseek-ai/cordis'
 import type { KernelSandboxProvider } from '../src/core/kernel.ts'
 import * as Kernels from '../src/index.ts'
@@ -427,15 +428,18 @@ describe('review regressions — per-conversation session identity (finding 1)',
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime, {})
+    await ctx.plugin(NativeToolExecutor)
     const fiber = ctx.plugin(Kernels, { languages: ['python', 'typescript'], snapshotDir: tempSnapshotDir() })
     try {
-      const call = (name: string, args: unknown, conversation: string) => ctx.tools.execute({
-        signal: new AbortController().signal,
-        callId: ToolCallId(`rr-${conversation}-${Math.random().toString(36).slice(2, 7)}`),
-        name,
-        arguments: args,
-        agent: { session: { header: { id: conversation, cwd: process.cwd() } } } as never,
-      })
+      const call = async (name: string, args: unknown, conversation: string) => {
+        // 0.2.2 dispatches whole model batches; unwrap the single result.
+        const batch = await ctx.tools.execute({
+          calls: [{ type: 'tool-call' as const, id: ToolCallId(`rr-${conversation}-${Math.random().toString(36).slice(2, 7)}`), name, arguments: JSON.stringify(args)}],
+          signal: new AbortController().signal,
+          agent: { session: { header: { id: conversation, cwd: process.cwd() } } } as never,
+        })
+        return batch.results[0]!.result
+      }
       const seed = await call('run_kernel_code', { language: 'python', code: 'shared = 99', session: 'shared' }, 'conv-a')
       expect(seed.isError).toBe(false)
       // The same session NAME in another conversation is a different kernel.
@@ -457,6 +461,7 @@ describe('review regressions — per-conversation session identity (finding 1)',
     const ctx = new Context()
     await ctx.plugin(SystemPrompt)
     await ctx.plugin(ToolRuntime, {})
+    await ctx.plugin(NativeToolExecutor)
     ctx.provide('workingDirectory' as never, {
       ensure: async () => {
         throw new Error('workspace is unavailable')
@@ -464,13 +469,12 @@ describe('review regressions — per-conversation session identity (finding 1)',
     } as never)
     const fiber = ctx.plugin(Kernels, { languages: ['python'], snapshotDir: tempSnapshotDir() })
     try {
-      const result = await ctx.tools.execute({
+      const batch = await ctx.tools.execute({
+        calls: [{ type: 'tool-call' as const, id: ToolCallId('rr-working-directory-failure'), name: 'run_kernel_code', arguments: JSON.stringify({ language: 'python', code: '1 + 1' }) }],
         signal: new AbortController().signal,
-        callId: ToolCallId('rr-working-directory-failure'),
-        name: 'run_kernel_code',
-        arguments: { language: 'python', code: '1 + 1' },
         agent: { session: { header: { id: 'cwd-failure', cwd: process.cwd() } } } as never,
       })
+      const result = batch.results[0]!.result
       expect(result.isError).toBe(true)
       const text = result.content.filter(block => block.type === 'text').map(block => block.text).join('')
       expect(text).toContain('workspace is unavailable')
