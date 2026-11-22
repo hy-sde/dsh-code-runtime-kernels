@@ -203,6 +203,8 @@ export interface KernelRunRequest {
    * stale one from whenever it was spawned.
    */
   cwd?: string
+  /** Per-run environment overrides. */
+  env?: Record<string, string>
   /** Optional host functions exposed to the program, one global object per namespace. */
   bindings?: PtcBindingNamespace[]
 }
@@ -541,6 +543,7 @@ export class KernelManager {
         ? await registry.executeOnSession(sessionId, request.code, bindings, {
           ...request.reset !== undefined ? { reset: request.reset } : {},
           ...request.cwd !== undefined ? { cwd: request.cwd } : {},
+          ...request.env !== undefined ? { env: request.env } : {},
           ...request.sandboxSessionId !== undefined ? { sandboxSessionId: request.sandboxSessionId } : {},
           signal: controller.signal,
         })
@@ -551,6 +554,7 @@ export class KernelManager {
           controller.signal,
           request.cwd,
           request.sandboxSessionId,
+          request.env,
         )
       return await this.finalize(outcome, timedOut, onOutputLimit)
     } catch (error: unknown) {
@@ -588,6 +592,8 @@ export class KernelManager {
         PYTHONUNBUFFERED: '1',
         PYTHONIOENCODING: 'utf-8',
         PYTHONDONTWRITEBYTECODE: '1',
+        // Decode the stdio pipes as UTF-8 regardless of the platform codepage.
+        PYTHONUTF8: '1',
         DSH_KERNEL_CWD: process.cwd(),
         ...this.#config.pythonImpl === 'ipykernel' ? { DSH_KERNEL_PYTHON_IMPL: 'ipykernel' } : {},
       },
@@ -640,8 +646,9 @@ export class KernelManager {
     signal: AbortSignal,
     cwd?: string,
     sandboxSessionId?: SessionId,
+    env?: Record<string, string>,
   ): Promise<KernelExecResult> {
-    const run = this.#oneShotRun(language, code, bindings, signal, cwd, sandboxSessionId)
+    const run = this.#oneShotRun(language, code, bindings, signal, cwd, sandboxSessionId, env)
     // Track the admitted run so teardown() quiesces its kernel.
     this.#oneshots.add(run)
     try {
@@ -658,12 +665,14 @@ export class KernelManager {
     signal: AbortSignal,
     cwd?: string,
     sandboxSessionId?: SessionId,
+    env?: Record<string, string>,
   ): Promise<KernelExecResult> {
     const kernel = await this.#startKernel(language, signal, sandboxSessionId)
     try {
       return await kernel.execute(randomUUID(), code, bindings, {
         signal,
         ...cwd !== undefined ? { cwd } : {},
+        ...env !== undefined ? { env } : {},
       })
     } catch (error: unknown) {
       return { status: 'error', logs: [], cancelled: false, invalidOutput: false, message: String(error), killed: false }

@@ -2,7 +2,9 @@
  * Python interpreter discovery and probing for kernel starts. Enumerates the
  * PATH (every match in PATH order, like omp's `$whichAll`) and probes each
  * candidate with a `-c` version check, so a broken shim on PATH falls through
- * to the next candidate instead of failing the kernel start.
+ * to the next candidate instead of failing the kernel start. The probe also
+ * enforces a Python 3.9 floor: an older interpreter exits with an encoded
+ * code and is named in the failure reason.
  * @module @hy-sde-org/dsh-code-runtime-kernels/src/core/python-discovery
  */
 
@@ -40,24 +42,45 @@ export function whichAll(command: string, env: { PATH?: string } = process.env, 
 
 /**
  * Ordered python candidates for one resolution: an explicitly configured
- * interpreter first, then every `python` and every `python3` on PATH (each
- * list in PATH order; a `python` match is tried before a `python3` match at
- * the same precedence; on win32, `.exe` matches come before bare names per
- * PATH entry).
+ * interpreter first, then every `python3` and every `python` on PATH (each
+ * list in PATH order; `python3` outranks `python` because a bare `python`
+ * is the name most often shadowed by python2 shims or launcher stubs; on
+ * win32, `.exe` matches come before bare names per PATH entry).
  */
 export function enumeratePythonCandidates(configured: string | undefined, env: { PATH?: string } = process.env, platform: NodeJS.Platform = process.platform): string[] {
   return [
     ...configured !== undefined ? [configured] : [],
-    ...whichAll('python', env, platform),
     ...whichAll('python3', env, platform),
+    ...whichAll('python', env, platform),
   ]
 }
 
-/** The `-c` probe program: a python ≥3 asserts its major version and prints `MAJOR.MINOR.MICRO`. */
-const PYTHON_PROBE_PROGRAM = "import sys; assert sys.version_info[0] >= 3; print('%d.%d.%d' % sys.version_info[:3])"
+/** The `-c` probe program: reports `MAJOR.MINOR.MICRO`, then exits 0 on python ≥3.9. */
+const PYTHON_PROBE_REPORT = "import sys;v=sys.version_info;print('%d.%d.%d' % v[:3])"
+/** Too-old exit encoding: `200 + 10*major + minor`, decoded by {@link describePythonProbeExit}. */
+const PYTHON_PROBE_TOO_OLD_EXIT = 'sys.exit(0 if v>=(3,9) else 200+min(v[0],3)*10+min(v[1],9))'
 
-/** Probe stdout that proves the `-c` program ran on a python ≥3. */
+const PYTHON_PROBE_PROGRAM = `${PYTHON_PROBE_REPORT};${PYTHON_PROBE_TOO_OLD_EXIT}`
+
+/** Probe stdout that proves the `-c` program ran on a python that prints a version. */
 const VERSION_REPORT = /^\d+\.\d+/
+
+/** Exit codes at or above this base encode the rejected python version in `10*major + minor`. */
+const TOO_OLD_EXIT_BASE = 200
+
+/** Minimum python minor version the probe accepts. */
+const MIN_PYTHON_MINOR = 9
+
+/**
+ * The too-old rejection reason for an encoded probe exit code, or `undefined`
+ * for any other exit code — those keep the generic exit/signal reason.
+ */
+function describePythonProbeExit(exitCode: number): string | undefined {
+  const encoded = exitCode - TOO_OLD_EXIT_BASE
+  // Below 20 is python 1.x or a foreign exit code; above 39 cannot be encoded.
+  if (encoded < 20 || encoded > 39) return undefined
+  return `Python ${Math.floor(encoded / 10)}.${encoded % 10} is too old; 3.${MIN_PYTHON_MINOR}+ required`
+}
 
 /** Failure-reason excerpt cap; the resolution error must stay single-line readable. */
 const EXCERPT_MAX_CHARS = 160
@@ -71,13 +94,18 @@ function outputExcerpt(text: string): string | undefined {
 
 /**
  * Probe one candidate with the `-c` version check under `timeoutMs`. Resolves
- * `undefined` when the interpreter works, or a single-line reason (spawn
- * error, non-zero exit, timeout, or a missing version report) otherwise.
+ * `undefined` when the interpreter works (a version report and exit 0), or a
+ * single-line reason otherwise: spawn error, timeout, missing version report,
+ * the named too-old version for an encoded exit code, or the generic
+ * exit/signal reason with an output excerpt.
  */
 export async function probePythonInterpreter(command: string, timeoutMs: number): Promise<string | undefined> {
   const child = spawn(command, ['-c', PYTHON_PROBE_PROGRAM], {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
+    // Decode probe output as UTF-8 regardless of the platform codepage
+    // (a Windows ANSI codepage otherwise mangles failure excerpts).
+    env: { ...process.env, PYTHONUTF8: '1' },
   })
   return await new Promise((resolve) => {
     let stdout = ''
@@ -108,6 +136,11 @@ export async function probePythonInterpreter(command: string, timeoutMs: number)
       const excerpt = outputExcerpt(stderr) ?? outputExcerpt(stdout)
       if (code === 0) {
         resolve(`no version report${excerpt !== undefined ? ` (${excerpt})` : ''}`)
+        return
+      }
+      const tooOld = code !== null ? describePythonProbeExit(code) : undefined
+      if (tooOld !== undefined) {
+        resolve(tooOld)
         return
       }
       const exit = code !== null

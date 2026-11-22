@@ -912,13 +912,30 @@ async def _handle_request_async(req: dict) -> None:
         _STATE.pending_done = None
         return
     cwd = req.get("cwd")
-    if isinstance(cwd, str):
+    if isinstance(cwd, str) and cwd:
         try:
             os.chdir(cwd)
-            if cwd not in sys.path:
-                sys.path.insert(0, cwd)
-        except OSError:
-            pass
+        except OSError as exc:
+            # The session cwd can vanish (a deleted scratch dir). Fall back to
+            # the last valid cwd, else HOME, and say so on the run's stderr.
+            try:
+                fallback = os.getcwd()
+            except OSError:
+                fallback = os.path.expanduser("~")
+            try:
+                os.chdir(fallback)
+            except OSError:
+                # A dead HOME too: run in place; file operations fail visibly.
+                pass
+            _emit({
+                "type": "log",
+                "id": rid,
+                "stream": "stderr",
+                "text": f"Warning: session cwd {cwd} is unavailable ({exc.strerror or exc}); this cell runs in {fallback}",
+            })
+            cwd = None
+        if cwd is not None and cwd not in sys.path:
+            sys.path.insert(0, cwd)
     env = req.get("env")
     if isinstance(env, dict):
         for key, value in env.items():

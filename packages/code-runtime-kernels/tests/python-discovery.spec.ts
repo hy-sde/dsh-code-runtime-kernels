@@ -1,7 +1,7 @@
 /**
  * Python interpreter resolution: PATH enumeration (`whichAll`), per-candidate
- * probing, resolution order (`config.pythonPath` first, `python` matches
- * before `python3`), the verified-candidate cache, and the aggregated
+ * probing, resolution order (`config.pythonPath` first, `python3` matches
+ * before `python`), the verified-candidate cache, and the aggregated
  * rejection when no candidate works. Shell-script shims stand in for
  * interpreters; only the kernel-boot integration shims `exec` the real
  * system python3 (guarded, like the rest of the suite).
@@ -124,6 +124,23 @@ describe('probePythonInterpreter', () => {
     await expect(probePythonInterpreter(shim, 5_000)).resolves.toBe('no version report (hello)')
   })
 
+  it('names the python version rejected by the 3.9 floor', async () => {
+    const shim = writeShim(makeFixtureDir(), 'python', 'exit 238')
+    await expect(probePythonInterpreter(shim, 5_000)).resolves.toBe('Python 3.8 is too old; 3.9+ required')
+  })
+
+  it('names python 2 the same way', async () => {
+    const shim = writeShim(makeFixtureDir(), 'python', 'exit 227')
+    await expect(probePythonInterpreter(shim, 5_000)).resolves.toBe('Python 2.7 is too old; 3.9+ required')
+  })
+
+  it('keeps the generic reason for exit codes outside the encoded too-old band', async () => {
+    const below = writeShim(makeFixtureDir(), 'python', 'exit 215')
+    await expect(probePythonInterpreter(below, 5_000)).resolves.toBe('exited with code 215')
+    const above = writeShim(makeFixtureDir(), 'python', 'exit 240')
+    await expect(probePythonInterpreter(above, 5_000)).resolves.toBe('exited with code 240')
+  })
+
   it('reports a spawn failure for a missing interpreter', async () => {
     const missing = join(makeFixtureDir(), 'missing-python')
     await expect(probePythonInterpreter(missing, 5_000)).resolves.toMatch(/^spawn failed \(.*ENOENT/)
@@ -131,15 +148,15 @@ describe('probePythonInterpreter', () => {
 })
 
 describe('enumeratePythonCandidates', () => {
-  it('puts config.pythonPath first, then python matches, then python3 matches, each in PATH order', () => {
+  it('puts config.pythonPath first, then python3 matches, then python matches, each in PATH order', () => {
     const first = makeFixtureDir()
     const second = makeFixtureDir()
-    const pyInSecond = writeShim(second, 'python', 'exit 0')
-    const py3InFirst = writeShim(first, 'python3', 'exit 0')
     const py3InSecond = writeShim(second, 'python3', 'exit 0')
+    const py3InFirst = writeShim(first, 'python3', 'exit 0')
+    const pyInSecond = writeShim(second, 'python', 'exit 0')
     const configured = '/opt/py/bin/python'
     expect(enumeratePythonCandidates(configured, { PATH: `${second}${delimiter}${first}` }))
-      .toEqual([configured, pyInSecond, py3InSecond, py3InFirst])
+      .toEqual([configured, py3InSecond, py3InFirst, pyInSecond])
   })
 
   it('on win32 enumerates .exe interpreters after the configured path', () => {
