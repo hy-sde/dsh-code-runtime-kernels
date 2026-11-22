@@ -39,6 +39,7 @@ import contextvars
 import importlib
 import io
 import json
+import linecache
 import marshal
 import os
 import pickle
@@ -211,6 +212,8 @@ class _RunnerState:
             "__builtins__": builtins,
         }
         self.loop: asyncio.AbstractEventLoop | None = None
+        # Incremented synchronously at request start; names each cell
+        # (<cell-N>) and is reported in that request's done frame.
         self.execution_count: int = 0
         self.cancel_requested: bool = False
         self.capture_rid: str | None = None
@@ -410,10 +413,10 @@ def _materialize_namespaces(run_id: str, ns: dict, namespaces: list[dict]) -> li
 _TLA_FLAG = getattr(ast, "PyCF_ALLOW_TOP_LEVEL_AWAIT", 0x2000)
 
 
-def _compile_source(source: str) -> tuple[Any, Any | None, bool]:
+def _compile_source(source: str, filename: str) -> tuple[Any, Any | None, bool]:
     """Returns (body_code, expr_code, ok). A parse OR compile error yields (None, None, False)."""
     try:
-        module = ast.parse(source, "<cell>", "exec")
+        module = ast.parse(source, filename, "exec")
     except SyntaxError:
         return None, None, False
     if not module.body:
@@ -424,10 +427,10 @@ def _compile_source(source: str) -> tuple[Any, Any | None, bool]:
             body_module = ast.Module(body=module.body[:-1], type_ignores=[])
             expr_module = ast.Expression(body=last.value)
             ast.copy_location(expr_module, last)
-            body_code = compile(body_module, "<cell>", "exec", flags=_TLA_FLAG)
-            expr_code = compile(expr_module, "<cell>", "eval", flags=_TLA_FLAG)
+            body_code = compile(body_module, filename, "exec", flags=_TLA_FLAG)
+            expr_code = compile(expr_module, filename, "eval", flags=_TLA_FLAG)
             return body_code, expr_code, True
-        return compile(module, "<cell>", "exec", flags=_TLA_FLAG), None, True
+        return compile(module, filename, "exec", flags=_TLA_FLAG), None, True
     except SyntaxError:
         # ast.parse alone accepts some AST-valid modules that compile
         # rejects (a top-level 'return', 'break'/'continue' outside a
@@ -436,6 +439,19 @@ def _compile_source(source: str) -> tuple[Any, Any | None, bool]:
         # source" instead of leaving the kernel waiting for a done frame
         # that never arrives.
         return None, None, False
+
+
+def _register_cell_source(source: str, filename: str) -> None:
+    """Register a cell's source under its <cell-N> name in linecache.
+
+    inspect.getsource/tracebacks resolve <...> filenames through
+    linecache.getlines(file, globals); the None mtime keeps
+    linecache.checkcache from discarding the entry.
+    """
+    lines = source.splitlines(keepends=True)
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        lines[-1] += "\n"
+    linecache.cache[filename] = (len(source), None, lines, filename)
 
 
 def _lossless_json(value: Any):
@@ -460,6 +476,7 @@ def _finish_run(
     run_id: str,
     *,
     status: str,
+    execution_count: int,
     value: Any = None,
     has_value: bool = False,
     cancelled: bool = False,
@@ -469,12 +486,11 @@ def _finish_run(
     """Build (but do not emit) the done frame; the request handler emits it
     after the snapshot save so the frame can carry the persistence statuses."""
     _STATE.last_status = "ok" if (status == "ok" and not cancelled) else "error"
-    _STATE.execution_count += 1
     frame: dict = {
         "type": "done",
         "id": run_id,
         "status": status,
-        "executionCount": _STATE.execution_count,
+        "executionCount": execution_count,
         "cancelled": cancelled,
     }
     if status == "ok" and has_value and not invalid_output:
@@ -500,7 +516,7 @@ async def _await_code(code_obj: Any, ns: dict) -> Any:
     return eval(code_obj, ns)
 
 
-async def _run_cell_ipython(code: str, run_id: str, namespaces: list[dict]) -> None:
+async def _run_cell_ipython(code: str, run_id: str, namespaces: list[dict], filename: str, execution_count: int) -> None:
     """IPython-mode cell: real shell semantics (magics, !cmd, display, TLA).
 
     run_cell_async executes inside the runner's live asyncio loop (run_cell
@@ -516,6 +532,10 @@ async def _run_cell_ipython(code: str, run_id: str, namespaces: list[dict]) -> N
     _STATE.capture_rid = run_id
     token = _CURRENT_RID.set(run_id)
     try:
+        # Registered before execution so even a failing cell's source stays
+        # inspectable under its <cell-N> name; IPython's native traceback
+        # filenames are kept.
+        _register_cell_source(code, filename)
         transformed_cell = None
         preprocessing_exc = None
         try:
@@ -537,25 +557,25 @@ async def _run_cell_ipython(code: str, run_id: str, namespaces: list[dict]) -> N
                 "evalue": str(exc) if exc is not None else "cell failed",
                 "traceback": tb,
             })
-            _finish_run(run_id, status="error", message=str(exc) if exc is not None else "cell failed")
+            _finish_run(run_id, status="error", execution_count=execution_count, message=str(exc) if exc is not None else "cell failed")
             return
         value = result.result
         if value is None:
-            _finish_run(run_id, status="ok")
+            _finish_run(run_id, status="ok", execution_count=execution_count)
             return
         serialized_ok, serialized = _lossless_json(value)
         if not serialized_ok:
-            _finish_run(run_id, status="error", invalid_output=True)
+            _finish_run(run_id, status="error", execution_count=execution_count, invalid_output=True)
             return
-        _finish_run(run_id, status="ok", value=serialized, has_value=True)
+        _finish_run(run_id, status="ok", execution_count=execution_count, value=serialized, has_value=True)
     except KeyboardInterrupt:
         _flush_stream_proxies(run_id)
         _STATE.cancel_requested = False
-        _finish_run(run_id, status="error", cancelled=True)
+        _finish_run(run_id, status="error", execution_count=execution_count, cancelled=True)
     except asyncio.CancelledError:
         _flush_stream_proxies(run_id)
         _STATE.cancel_requested = False
-        _finish_run(run_id, status="error", cancelled=True)
+        _finish_run(run_id, status="error", execution_count=execution_count, cancelled=True)
         raise
     finally:
         _CURRENT_RID.reset(token)
@@ -567,9 +587,9 @@ async def _run_cell_ipython(code: str, run_id: str, namespaces: list[dict]) -> N
                 ns[name] = previous
 
 
-async def _run_cell(code: str, run_id: str, namespaces: list[dict]) -> None:
+async def _run_cell(code: str, run_id: str, namespaces: list[dict], filename: str, execution_count: int) -> None:
     if _IPYTHON_SHELL is not None:
-        await _run_cell_ipython(code, run_id, namespaces)
+        await _run_cell_ipython(code, run_id, namespaces, filename, execution_count)
         return
     sys.stdout = _StreamProxy("stdout")
     sys.stderr = _StreamProxy("stderr")  # noqa: F841 - kept for symmetry
@@ -582,9 +602,12 @@ async def _run_cell(code: str, run_id: str, namespaces: list[dict]) -> None:
     _STATE.capture_rid = run_id
     token = _CURRENT_RID.set(run_id)
     try:
-        body_code, expr_code, ok = _compile_source(code)
+        body_code, expr_code, ok = _compile_source(code, filename)
+        # Registered before the ok check so even compile-error cells show
+        # their source in tracebacks.
+        _register_cell_source(code, filename)
         if not ok:
-            _finish_run(run_id, status="error", message="invalid Python source")
+            _finish_run(run_id, status="error", execution_count=execution_count, message="invalid Python source")
             return
         try:
             if body_code is not None:
@@ -595,12 +618,12 @@ async def _run_cell(code: str, run_id: str, namespaces: list[dict]) -> None:
         except KeyboardInterrupt:
             _flush_stream_proxies(run_id)
             _STATE.cancel_requested = False
-            _finish_run(run_id, status="error", cancelled=True)
+            _finish_run(run_id, status="error", execution_count=execution_count, cancelled=True)
             return
         except asyncio.CancelledError:
             _flush_stream_proxies(run_id)
             _STATE.cancel_requested = False
-            _finish_run(run_id, status="error", cancelled=True)
+            _finish_run(run_id, status="error", execution_count=execution_count, cancelled=True)
             return
         except BaseException as exc:  # noqa: BLE001 - model code may raise anything
             _flush_stream_proxies(run_id)
@@ -612,21 +635,21 @@ async def _run_cell(code: str, run_id: str, namespaces: list[dict]) -> None:
                 "evalue": str(exc),
                 "traceback": tb,
             })
-            _finish_run(run_id, status="error", message=str(exc))
+            _finish_run(run_id, status="error", execution_count=execution_count, message=str(exc))
             return
         _flush_stream_proxies(run_id)
         if _STATE.cancel_requested:
             _STATE.cancel_requested = False
-            _finish_run(run_id, status="error", cancelled=True)
+            _finish_run(run_id, status="error", execution_count=execution_count, cancelled=True)
             return
         if expr_code is not None:
             serialized_ok, serialized = _lossless_json(value)
             if not serialized_ok:
-                _finish_run(run_id, status="error", invalid_output=True)
+                _finish_run(run_id, status="error", execution_count=execution_count, invalid_output=True)
                 return
-            _finish_run(run_id, status="ok", value=serialized, has_value=True)
+            _finish_run(run_id, status="ok", execution_count=execution_count, value=serialized, has_value=True)
         else:
-            _finish_run(run_id, status="ok")
+            _finish_run(run_id, status="ok", execution_count=execution_count)
     finally:
         _CURRENT_RID.reset(token)
         _STATE.capture_rid = None
@@ -904,10 +927,15 @@ async def _handle_request_async(req: dict) -> None:
     rid = req.get("id")
     if not isinstance(rid, str) or not rid:
         return
+    # Count and name the cell synchronously, before any await: concurrent
+    # cells get distinct counts and distinct <cell-N> filenames.
+    _STATE.execution_count += 1
+    execution_count = _STATE.execution_count
+    filename = f"<cell-{execution_count}>"
     code = req.get("code")
     if not isinstance(code, str):
         _emit({"type": "error", "id": rid, "ename": "ProtocolError", "evalue": "code must be a string", "traceback": []})
-        _finish_run(rid, status="error", message="code must be a string")
+        _finish_run(rid, status="error", execution_count=execution_count, message="code must be a string")
         _emit(_STATE.pending_done)
         _STATE.pending_done = None
         return
@@ -956,15 +984,15 @@ async def _handle_request_async(req: dict) -> None:
         _STATE.restore_status = _restore_snapshot(_STATE.snapshot_spec, rid)
     _STATE.cancel_requested = False
     try:
-        await _run_cell(code, rid, namespaces)
+        await _run_cell(code, rid, namespaces, filename, execution_count)
     except asyncio.CancelledError:
         _STATE.cancel_requested = False
-        _finish_run(rid, status="error", cancelled=True)
+        _finish_run(rid, status="error", execution_count=execution_count, cancelled=True)
     finally:
         # Defensive: every path through _run_cell settles the run; if one ever
         # escapes without a done frame, the host would otherwise wait forever.
         if _STATE.pending_done is None:
-            _finish_run(rid, status="error", message="runner finished without a completion record")
+            _finish_run(rid, status="error", execution_count=execution_count, message="runner finished without a completion record")
         # Snapshot save BEFORE the done frame: the host reads the persistence
         # statuses off the done frame, so the save (and its failure) must have
         # happened by the time the frame is emitted.
